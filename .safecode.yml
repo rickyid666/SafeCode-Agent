@@ -8,12 +8,35 @@ security:
     enabled: true
     required_in_ci: true
     timeout_seconds: 120
+    # 声明清单必须与 CI 实际安装的一致：严格模式/CI 下"声明了但不可用"一律 DENY。
+    # 想加 gitleaks / trufflehog，就同时把安装步骤加进 .github/workflows/security.yml。
     tools:
-      - gitleaks
-      - trufflehog
       - detect-secrets
-  ignore_paths: []
-  allow_list: []
+  ignore_paths:
+    # 构建/缓存产物，不是源码；不进扫描范围
+    - .pytest_cache/
+    - __pycache__/
+  allow_list:
+    # 以下是"启发式外部 Scanner 在 SafeCode 自己身上必然误报"的精确例外。
+    # 每条都限定 rule + path，并写明原因；不是通配，也不影响 Native 规则。
+    - rule: "Secret Keyword"
+      path: rules/security.md
+      reason: "文档示例：这里故意写出占位符写法，契约要求它必须被放过"
+    - rule: "Secret Keyword"
+      path: scripts/safecode_secret.py
+      reason: "检测器自身的占位符词表，启发式 scanner 会把词表本身当成命中"
+    - rule: "Secret Keyword"
+      path: scripts/security-scan.py
+      reason: "检测器实现里的规则常量与说明文字"
+    - rule: "Secret Keyword"
+      path: tests/test_security.py
+      reason: "测试夹具为运行时拼接的合成值，不含真实凭据"
+    - rule: "Hex High Entropy String"
+      path: tests/test_security.py
+      reason: "合成夹具：会话型凭据样例，运行时拼接"
+    - rule: "Base64 High Entropy String"
+      path: tests/test_security.py
+      reason: "合成夹具：JWT 样例，运行时拼接"
   custom_rules: []
 
 testing:

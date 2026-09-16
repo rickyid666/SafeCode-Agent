@@ -383,6 +383,10 @@ def validate_config(data: Dict[str, Any]) -> List[str]:
                             errors.append("allow_list entry requires a non-empty 'rule'")
                         elif rule.strip() == "*":
                             errors.append("allow_list rule '*' is not allowed: it would disable the scanner globally")
+                        elif re.search(r"[\x00-\x1f]", rule):
+                            errors.append("allow_list rule must not contain control characters")
+                        elif rule != rule.strip():
+                            errors.append(f"allow_list rule must not have surrounding whitespace: {rule!r}")
                         if not isinstance(path, str) or not path.strip():
                             errors.append("allow_list entry requires a non-empty 'path'")
                         elif path.strip() == "*":

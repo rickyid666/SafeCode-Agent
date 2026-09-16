@@ -132,9 +132,8 @@ security:
   external_scanners:
     enabled: true
     required_in_ci: true
+    # 这份清单必须与 CI 实际安装的工具一致，否则严格模式会因"声明了但不可用"而 DENY
     tools:
-      - gitleaks
-      - trufflehog
       - detect-secrets
   ignore_paths: []
   allow_list: []
@@ -233,6 +232,24 @@ dependency    .github/workflows/security.yml 依赖供应链
 `operation_fingerprint = sha256(操作 + 仓库身份 + 仓库状态 + 目标 + 相关 diff)`。
 令牌一次性、默认 10 分钟过期、绑定单一操作，改一个参数就重新要授权。
 Hard Stop 不阻塞等 stdin，无人值守环境同样能直接退出。
+
+### 外部 Scanner 声明必须与 CI 安装一致
+
+严格模式 / CI 下，**声明了但不可用**的外部 Scanner 一律 DENY（Fail-Closed）。所以
+`.safecode.yml` 的 `security.external_scanners.tools` 列表必须与
+`.github/workflows/security.yml` 里真正安装的工具一致。本仓库只声明
+`detect-secrets`（PyPI 安装，最稳），要加 `gitleaks` / `trufflehog` 就同时把安装
+步骤加进 workflow，否则下次推送就红了。
+
+本地没装任何外部 Scanner 时不会挡住开发：那是 `DEGRADED`，本地可以继续，但
+`DEGRADED` 不是 PASS。
+
+### 本仓库自己的例外
+
+SafeCode 要求"例外必须显式、可审计"，它对自己也执行这一条。仓库的 `.safecode.yml`
+里有几条 `allow_list`，针对的是启发式外部 Scanner 在 SafeCode 自己身上必然误报的位置：
+检测器源码里的占位符词表、文档里的示例写法、测试夹具（值为运行时拼接的合成值）。
+每条都限定 `rule + path` 并写明原因，既不是通配也不影响 Native 规则的检测范围。
 
 ## 仓库结构
 
