@@ -47,21 +47,37 @@ def hook_script_content() -> str:
         "# SafeCode managed pre-push hook. Client-side gate only; not the sole boundary.\n"
         "# CI Required Checks + Branch Protection are independent defenses.\n"
         'HOOK_DIR=$(cd "$(dirname "$0")" && pwd)\n'
-        'REPO_ROOT=$(cd "$HOOK_DIR/.." && pwd)\n'
+        "# 优先用 git 给出的仓库根（Windows 上是 C:/... 形式，Windows Python 能直接吃）\n"
+        'REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)\n'
+        'if [ -z "$REPO_ROOT" ]; then\n'
+        '  REPO_ROOT=$(cd "$HOOK_DIR/.." && pwd)\n'
+        "fi\n"
+        "# Git Bash / MSYS 下 pwd 会给 /c/... 形式，Windows Python 会误解成 C:\\\\c\\\\...，能转就转\n"
+        'if command -v cygpath >/dev/null 2>&1; then\n'
+        '  REPO_ROOT=$(cygpath -w "$REPO_ROOT" 2>/dev/null || echo "$REPO_ROOT")\n'
+        "fi\n"
         "# 探测可用的 Python 解释器；找不到就阻断（fail-closed，绝不静默放行）\n"
+        'PY_BIN=""\n'
         'if [ -n "$SAFECODE_PYTHON" ] && command -v "$SAFECODE_PYTHON" >/dev/null 2>&1; then\n'
-        '  exec "$SAFECODE_PYTHON" "$REPO_ROOT/scripts/pre-push.py" "$@"\n'
+        '  PY_BIN="$SAFECODE_PYTHON"\n'
+        "elif command -v python3 >/dev/null 2>&1; then\n"
+        "  PY_BIN=python3\n"
+        "elif command -v python >/dev/null 2>&1; then\n"
+        "  PY_BIN=python\n"
+        "elif command -v py >/dev/null 2>&1; then\n"
+        '  PY_BIN="py -3"\n'
+        "else\n"
+        '  echo "SafeCode: no python interpreter found, blocking push (fail-closed)" >&2\n'
+        "  exit 1\n"
         "fi\n"
-        "for candidate in python3 python; do\n"
-        '  if command -v "$candidate" >/dev/null 2>&1; then\n'
-        '    exec "$candidate" "$REPO_ROOT/scripts/pre-push.py" "$@"\n'
-        "  fi\n"
-        "done\n"
-        'if command -v py >/dev/null 2>&1; then\n'
-        '  exec py -3 "$REPO_ROOT/scripts/pre-push.py" "$@"\n'
+        "# 注意：git 会把 <remote-name> <remote-url> 作为位置参数传给 hook，\n"
+        "# 不能把它们转交给 SafeCode 脚本（那会变成用法错误，挡掉每一次推送）。\n"
+        "# hook 需要的 ref 信息走 stdin。调试参数请用 SAFECODE_PREPUSH_ARGS。\n"
+        'if [ -n "$SAFECODE_PREPUSH_ARGS" ]; then\n'
+        "  # shellcheck disable=SC2086\n"
+        '  exec $PY_BIN "$REPO_ROOT/scripts/pre-push.py" $SAFECODE_PREPUSH_ARGS\n'
         "fi\n"
-        'echo "SafeCode: no python interpreter found, blocking push (fail-closed)" >&2\n'
-        "exit 1\n"
+        'exec $PY_BIN "$REPO_ROOT/scripts/pre-push.py"\n'
     )
 
 

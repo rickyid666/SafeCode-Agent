@@ -12,6 +12,8 @@ __pycache__/
 *.out
 pytest_*.txt
 dep_out.txt
+push_out.txt
+hook_sim.*
 scan_*.json
 scan_*.err
 .pytest_tmp/

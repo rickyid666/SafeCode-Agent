@@ -14,6 +14,7 @@
 """
 
 import os
+import shutil
 import sys
 
 import pytest
@@ -23,6 +24,7 @@ SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sc
 sys.path.insert(0, os.path.abspath(SCRIPTS_DIR))
 
 from conftest import (  # noqa: E402
+    run_cmd,
     run_script,
     parse_json_output,
     assert_result_schema,
@@ -355,3 +357,36 @@ def test_hook_lifecycle(tmp_git_repo):
     proc = run_script("hook-manager.py", "--json", "verify", cwd=repo)
     assert proc.returncode == 0, proc.stderr
     assert parse_json_output(proc)["code"] == "HOOK_VERIFIED"
+
+
+def test_hook_survives_git_positional_args(tmp_git_repo):
+    """回归：git 会以 `<remote-name> <remote-url>` 调用 hook。
+
+    早期实现把 "$@" 原样转交给 pre-push.py，于是每次推送都被 argparse 判成
+    用法错误而拦下——fail-closed 生效了，但拦错了对象。这里锁住行为：
+    带着 git 的位置参数调用 hook，必须仍然正常跑完流水线。
+    """
+    repo = tmp_git_repo
+    # hook 会把仓库根下的 scripts/ 当成 SafeCode 实现来调用，所以先把脚本放进去
+    shutil.copytree(os.path.abspath(SCRIPTS_DIR), repo / "scripts")
+    install = run_script("hook-manager.py", "--json", "install", cwd=repo)
+    assert install.returncode == 0, install.stderr
+
+    hook = repo / ".githooks" / "pre-push"
+    assert hook.is_file()
+    content = hook.read_text(encoding="utf-8")
+    assert '"$@"' not in content, "hook 不能把 git 的位置参数转发给 SafeCode 脚本"
+
+    sh = shutil.which("sh")
+    if sh is None:
+        pytest.skip("sh not available")
+
+    env = {"SAFECODE_PYTHON": sys.executable,
+           "SAFECODE_PREPUSH_ARGS": "--dry-run --skip-tests"}
+    proc = run_cmd([sh, str(hook), "origin", "https://example.invalid/repo.git"],
+                   cwd=repo, env=env)
+    assert "unrecognized arguments" not in proc.stderr, proc.stderr
+    assert proc.returncode == 0, proc.stderr
+    payload = parse_json_output(proc)
+    assert_result_schema(payload)
+    assert payload["code"] == "PIPELINE_PASSED"
