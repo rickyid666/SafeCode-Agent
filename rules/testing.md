@@ -1,108 +1,74 @@
-# 测试优先级与可测试性设计
+# rules/testing.md — 测试规则（软约束）
 
-本规则约束 SafeCode Agent 的自动化测试策略。测试优先覆盖核心业务逻辑，而不是一上来追求 UI 全覆盖。
+## 测什么
 
-## 测试优先级
+优先覆盖核心业务逻辑，不要一上来追求 UI 全覆盖。顺序：
 
 1. 核心逻辑单元测试
-2. 状态机测试
-3. 多任务 / 并发测试
+2. 状态机
+3. 多任务 / 并发
 4. Web E2E
 5. CLI E2E
-6. Android / 桌面端构建测试
+6. 桌面端 / Android 构建
 
-先保证 1–3 稳定，再做 4–6 的端到端验证。
+至少覆盖：单任务启动、单任务停止、waiting 状态、waiting -> running、
+running -> stopped、开播轮询、异常重试、任务取消、多房间互不污染、请求闸门、
+配置错误、网络异常。
 
 ## 可测试性设计
 
-不要把等待时间硬编码进业务逻辑。把时间、Sleep、网络请求等外部依赖抽象出来，使测试可以注入更短的值或 Mock。
-
-反例（生产写死，测试跑得慢且不可控）：
+不要把等待时间硬编码在业务逻辑里：
 
 ```python
+# 生产
 LIKE_INTERVAL = 1.0
 WAIT_LIVE_INTERVAL = 5.0
 RETRY_INTERVAL = 3.0
 REQUEST_TIMEOUT = 10.0
 ```
 
-正例（常量可注入，测试用小值）：
+测试环境用更短的值，或者更彻底一点——把时间、sleep、网络请求抽象出去，
+让测试注入 Mock。生产配置与测试配置必须明确分离。
 
-```python
-LIKE_INTERVAL = 1.0
-WAIT_LIVE_INTERVAL = 5.0
-RETRY_INTERVAL = 3.0
-REQUEST_TIMEOUT = 10.0
+## 测试怎么写（就本仓库而言）
 
-# 测试环境覆盖为更短的值
-LIKE_INTERVAL = 0.01
-WAIT_LIVE_INTERVAL = 0.01
-RETRY_INTERVAL = 0.01
+黑盒优先：用 subprocess 调 CLI，断言 Structured JSON 与退出码，而不是断言内部函数。
+这样测试验证的是契约，实现重构不会让测试白写。
+
+外部依赖用 PATH 桩：不装 `gitleaks`、`osv-scanner` 也能测"Scanner 异常必须 DENY"——
+在临时目录造一个假的同名可执行文件，让它输出合法 JSON / 退出非零 / 输出垃圾，
+三种情况各测一遍。Windows 上记得同时提供 `.bat`/`.cmd`。
+
+不要在测试里写真实格式的凭据字面量，需要样例就运行时拼接。
+
+## 失败不等于 Bug
+
+一次 FAIL 不代表代码错了。分类：
+
+```
+Compile Error / Assertion Failure / Dependency Error
+Environment Error / Real Bug / Flaky Test / Unknown
 ```
 
-更理想的方式是把时间、Sleep、网络请求等外部依赖抽象成可替换的接口，测试时注入 Mock，而不是只靠调小常量。
+- `Flaky Test` 和 `Environment Error` 不要默认去改业务代码。
+- 无法归类的失败按 L6 处理：停下来问，不要猜。
 
-**生产配置与测试配置必须明确分离。** 测试用假凭据、短间隔、Mock 后端；生产用真实配置。不要把测试配置误带进生产分支。
+## Flaky 检测
 
-## 推荐核心测试清单
-
-至少覆盖：
-
-- 单任务启动
-- 单任务停止
-- waiting 状态
-- waiting → running 转换
-- running → stopped 转换
-- 开播轮询
-- 异常重试
-- 任务取消
-- 多房间互不污染（并发隔离）
-- 请求闸门（限流/并发控制）
-- 配置错误
-- 网络异常
-
-## Web E2E 流程
-
-```text
-启动 Web
- ↓
-创建任务
- ↓
-waiting
- ↓
-模拟开播
- ↓
-running
- ↓
-模拟点赞
- ↓
-停止
- ↓
-stopped
+```
+初始 Test -> FAIL
+   -> 代码与环境不变，额外 rerun 3 次（默认）
+   -> 比较结果
 ```
 
-## CLI E2E 流程
+- 结果不稳定（既有 PASS 又有 FAIL）-> `category = FLAKY_TEST`，停止无意义的代码修改。
+- 三次都 FAIL -> 不认定 Flaky，走正常错误分类。
+- 三次都 PASS（初始 FAIL 之后）-> 同样是 Flaky，一样记录。
 
-```text
-启动 CLI
- ↓
-传入房间
- ↓
-创建任务
- ↓
-模拟开播
- ↓
-running
- ↓
-停止
- ↓
-正常退出
-```
+每次 rerun 都要记录 run 序号、退出码、失败测试 id、代码状态（HEAD）、环境摘要，
+让结果可复现、可审计。rerun 消耗 Test Budget，不消耗 Recovery 次数。
 
-## 与脚本的对应关系
+## 测试结果要能被机器读
 
-```bash
-python scripts/test-runner.py --json
-```
-
-`test-runner.py` 跑 pytest，并把失败分类为 L1–L6（见 `rules/recovery.md`）。测试全绿后才允许进入安全扫描与 Push；有失败先走自愈流程。
+`test-runner.py` 会把结果整理成 Structured JSON：等级（L0..L6）、类别、失败测试列表、
+每次运行记录、预算快照。Recovery 读的是这些结构化字段，不是正则去啃自然语言日志。

@@ -1,93 +1,120 @@
-# Git 门禁与禁止的高危操作
-
-本规则约束 SafeCode Agent 在提交与推送前后的 Git 行为，核心是把危险操作拦在 Push 之前。
+# rules/git.md — Git 规则（软约束）
 
 ## Push 前检查链
 
-推送前必须按顺序走完以下检查，任何一环不过都不允许 Push：
-
-```text
-工作区状态
- ↓
-当前分支
- ↓
-Diff
- ↓
-新增文件
- ↓
-测试
- ↓
-安全扫描
- ↓
-确认没有危险操作
- ↓
-允许 Push
+```
+工作区状态 -> 当前分支 -> Diff -> 新增文件 -> 测试
+ -> 安全扫描 -> 依赖检查 -> 确认没有危险操作 -> 允许 Push
 ```
 
-对应脚本：
+入口是 `python scripts/pre-push.py`（或 `safecode pre-push`）。它把每个 Gate 的
+Structured JSON 与退出码交给 Decision Resolver 汇总，取最严格的结果。
 
-```bash
-git status                                  # 工作区状态
-git branch                                  # 当前分支
-git diff ; git diff --cached                # Diff 与已暂存
-# 列出未跟踪但将被提交的文件（新增文件）
-python scripts/test-runner.py               # 测试
-python scripts/security-scan.py --staged    # 安全扫描
-python scripts/pre-push.py                  # 总门禁
+Git Guard 至少要看这些：
+
+```
+branch / git status / staged diff / unstaged diff
+untracked files / recent commits / outgoing push content
 ```
 
-`scripts/pre-push.py` 会依次验证：状态 → 分支 → Diff → 新增文件 → 测试 → 安全扫描 → 允许 Push。建议把它接入 `git push` 流程，也建议把 `git-guard.py --pre-push` 挂到仓库的 pre-push hook 上。
+## 高危操作
 
-## 禁止自动执行的高危操作
+这些默认不允许 Agent 自动执行：
 
-除非用户明确授权，否则 Skill 不得自行执行：
-
-- 删除大量项目文件
-- 删除 Git 历史
-- 强制 Push（`git push --force` / `--force-with-lease`）
+- `git push --force`（以及任何等价写法）
 - `git reset --hard` 到未知提交
-- 修改生产环境
-- 上传私人数据
-- 暴露本地服务到公网
-- 删除凭据以外的用户数据
+- 历史改写：`filter-branch`、`filter-repo`、交互式 rebase
+- 大量删除文件 / 删除 Git 历史
+- 修改生产环境、删除生产数据
+- 上传私密数据、把本地服务暴露到公网
+- 任何不可恢复的数据删除
 
-清理 Git 历史（如 `filter-branch`、`git rebase` 改写已推送历史）属于高危操作，必须在发现凭据泄露且用户明确授权后进行，并优先完成凭据轮换（见 `rules/security.md`）。
+命中之后不是"建议问一下"，而是可执行的 Hard Stop：
 
-## checkpoint（可恢复点）
-
-进行高风险修改前，记录当前状态以便回滚：
-
-```bash
-git status
-git branch
-git diff
+```
+Agent 请求执行高危操作
+ -> SafeCode Preflight
+ -> risk = HIGH
+ -> HARD STOP
+ -> 输出 Structured Authorization Request
+ -> 停止当前流程
 ```
 
-必要时建立 checkpoint 或临时分支：
+## Hard Stop 不阻塞等待输入
 
-```bash
-git stash                       # 暂存当前改动
-git checkout -b fix/xxx-tmp     # 临时分支隔离实验性修改
-git commit -m "checkpoint: ..." # 明确标注的临时提交
+SafeCode 负责判断风险、阻止操作、输出结构化授权请求、停止流程。
+展示授权请求、拿到人工批准、决定怎么重新执行，是宿主环境的事。
+
+因此 Hard Stop 的语义是"停止当前流程"，不是"卡在那里等 stdin"。CI、Cron、
+后台 Agent 这类无人值守环境必须能直接退出，不能挂住。
+
+## 授权必须绑定具体操作
+
+"用户说可以"不算授权。授权绑定到操作指纹：
+
+```
+operation_fingerprint = sha256(
+    规范化后的操作 + 仓库身份 + 仓库状态 + 目标 + 相关 diff
+)
 ```
 
-后续若无法可靠修复，优先恢复到上述已知安全状态：
+所以：
 
-```bash
-git checkout <原分支>
-git stash pop                   # 或 git reset 回 checkpoint
+```
+批准 force push A  !=  批准 force push B
 ```
 
-不要留着一堆半成品改动继续堆新改动。L4 工作区异常时，按 `rules/recovery.md` 停止并恢复 checkpoint。
+改一个参数就要重新授权。Approval Token 的字段：
 
-## 与脚本的对应关系
-
-```bash
-# 配合 git pre-push hook，检测强推/历史改写等危险操作
-python scripts/git-guard.py --pre-push
-
-# 总门禁：状态 → 分支 → Diff → 新增文件 → 测试 → 安全扫描 → 允许 Push
-python scripts/pre-push.py
+```json
+{
+  "schema_version": "1.0",
+  "token_type": "APPROVAL",
+  "operation": "git push --force",
+  "operation_fingerprint": "sha256:...",
+  "approved_by": "human",
+  "issued_at": "2026-09-16T00:00:00Z",
+  "expires_at": "2026-09-16T00:10:00Z",
+  "nonce": "..."
+}
 ```
 
-遇到拿不准的 Git 操作，停止并请求人工确认。
+验证时必须检查：`token_type`、`operation`、`operation_fingerprint`、有效期、
+nonce 是否已用过、仓库/目标绑定。以下一律拒绝：过期、已使用、指纹不匹配、
+操作参数变化、仓库或目标不匹配、格式无效。
+
+Token 只授权"已明确描述的单一操作"，不能变成永久解锁 SafeCode 的开关。
+
+## 三层防线，缺一层就等于没有
+
+```
+Tier 1  .git/hooks/pre-push -> scripts/pre-push.py   本地
+Tier 2  GitHub Actions: test / security / dependency CI
+Tier 3  Branch Protection: Required status checks    服务端
+```
+
+- 删掉本地 hook 只会让本地保护失效，CI 仍然会拦。
+- `git push --no-verify` 可以绕过客户端 hook，因此它**不得被视为安全流程通过**；
+  出现即记录为绕过事件。
+- CI 跑过了，但对应 job 没被配成 Required Check，就不能声称"Push/Merge 已被服务端强制保护"。
+
+SafeCode 提供 hook 的 install / verify / update 三种生命周期操作。verify 要检查：
+`core.hooksPath` 是否指向 `.githooks`、hook 是否存在、是否可执行、是否还在调用当前
+SafeCode 版本、有没有被别的脚本替换。
+
+## Checkpoint
+
+改高风险代码之前：
+
+```bash
+git status && git branch --show-current && git diff
+```
+
+必要时建临时分支或先 commit 一个可恢复点。修不回来时优先恢复到已知安全状态，
+而不是继续往上堆修改。
+
+## 提交内容本身也要过检查
+
+- 只检查"本次实际准备提交的内容"，不要拿整个工作区的历史噪音当结论。
+- 大批量删除、重命名、二进制大文件、`.env` 之类敏感文件被纳入版本管理，
+  都要在 Diff 审查阶段明确看到，不能"顺手提交"。

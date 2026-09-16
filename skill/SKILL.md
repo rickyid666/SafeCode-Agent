@@ -1,135 +1,146 @@
 ---
 name: safecode-agent
-description: 给 AI Coding Agent 套上可刹车的安全开发工作流——开发任务中自动执行 检查→修改→测试→自救→安全扫描→Diff审查→Push，并在安全风险、连续失败或拿不准时停止请求确认。
+description: 面向 AI Coding Agent 的安全开发工作流：检查 -> 修改 -> 测试 -> 失败自救 -> 安全扫描 -> Diff 审查 -> Push -> CI 再验证。当你要连续写代码、跑测试、修复失败并提交推送，需要在危险操作前刹车、在检查未通过时拒绝进入 Git 时使用。
 ---
 
 # SafeCode Agent
 
-面向 AI Coding Agent 的通用安全开发 Skill。它不写业务代码，只提供一条带刹车的安全工程工作流。
+这个 Skill 提供一套安全的工程工作流。它不替你写业务代码，它管的是**流程的可信度**。
 
-触发场景：Agent 开始任何写代码/改代码/测试/修复/推送的开发任务时加载本 Skill，并在整个过程中遵循以下流程。
+一句最重要的话：**不要相信"AI 说自己检查过了"。** 关键安全规则由 `scripts/` 下的
+可执行门禁强制执行，你要做的是调用它们、读取它们的退出码，并且尊重结果。
+
+依赖规则细节时读 `../rules/`：
+
+- `../rules/security.md` — 安全扫描、Baseline、凭据泄露处理
+- `../rules/testing.md` — 测试优先级、Flaky 检测
+- `../rules/recovery.md` — 错误等级、自救预算
+- `../rules/git.md` — Git 门禁、Hard Stop、授权令牌
 
 ## 工作流
 
-```text
-Plan
- ↓
-Inspect
- ↓
-Modify
- ↓
-Test
- ↓
-Recover (if needed)
- ↓
-Security Scan
- ↓
-Review Diff
- ↓
-Push
-```
+### 1. Plan
 
-详细规则见 `../rules/`：`security.md`、`testing.md`、`recovery.md`、`git.md`。脚本位于 `../scripts/`。
+先说清楚要改什么、验收标准是什么。有多个工作区 / 构建目录 / 同步副本时，
+先确定唯一基准：**以实际 Git 仓库为唯一代码事实来源**。测试、构建、提交必须针对
+同一份代码，避免"改了 A 测了 B"。
 
----
+### 2. Inspect
 
-## Plan
-
-明确本次任务目标与范围，确认改动会落在哪个分支、影响哪些文件。不要一上来就改。
-
-## Inspect（对照 rules：先检查再修改）
-
-动手前必须检查当前项目状态：
+动手前先看清状态：
 
 ```bash
-git branch            # 当前分支
-git status            # 工作区状态
-git diff              # 未暂存改动
-git log -n 5          # 最近提交
+git status --porcelain
+git branch --show-current
+git log --oneline -5
+python scripts/safecode.py git guard --status
 ```
 
-同时确认构建方式、测试方式，以及项目规则文件（`AGENTS.md`、`CLAUDE.md` 或其他 Skill）。不了解状态时不许大规模改动。
+同时确认项目的构建方式、测试方式，以及项目规则文件（`AGENTS.md`、`CLAUDE.md`
+或其他 Skill）。工作区与远端不一致时先对齐，再开始改。
 
-以实际 Git 仓库为唯一代码基准（见 `../rules/git.md`）：所有测试、构建、提交都针对同一份工作区。
+高风险改动前留一个可恢复点（`git status` / `git diff` 记录、临时分支或 commit）。
 
-## Modify
+### 3. Modify
 
-按 Plan 改代码。高风险改动前先留 checkpoint：
+按计划改。改的范围要能对应到步骤 1 的验收标准，不要顺手重构无关代码。
+
+### 4. Test
 
 ```bash
-git status
-git branch
-git diff
+python scripts/safecode.py test run
 ```
 
-必要时建临时分支或 commit，保证后续修不回来时能回滚。生产配置与测试配置必须分离（见 `../rules/testing.md`）。
+结构化结果会给出等级（L0..L6）、类别、失败测试列表，以及每次运行记录。
+失败时**读 JSON，不要去正则解析自然语言日志**。
 
-## Test
+Flaky 与环境类失败不要去改业务代码，改测试或修环境。
+
+### 5. Recover if needed
+
+失败后按等级决定动作（`rules/recovery.md` 有完整表）：
+
+```
+L1/L2  -> 在预算内自动修复
+L3     -> 尝试恢复环境/依赖，恢复不了就停
+L4     -> 停止并恢复工作区
+L5     -> HARD STOP，不自行绕过
+L6     -> HARD STOP + 请求人工授权
+```
+
+预算记在 `.safecode/state/<task-id>.json`：`max_recovery_attempts=3`、
+`max_total_test_runs=20`、`max_total_recoveries=10`、`max_total_time=30m`。
+连续失败 3 次或预算耗尽就停手，输出诊断报告，交人工。
 
 ```bash
-python ../scripts/test-runner.py --json
+python scripts/safecode.py recover status
 ```
 
-跑 pytest，脚本会把失败分类为 L1–L6。要求全绿；有失败进入 Recover。测试可测试性要求见 `../rules/testing.md`（时间常量可注入、Mock 外部依赖、生产/测试配置分离）。
-
-## Recover（自救，上限 3 轮）
-
-测试失败 → 读完整错误 → 分类（编译/断言/依赖/环境/真实 Bug/无法确定）→ 尝试修复 → 重测。用脚本记录轮数：
+### 6. Security Scan
 
 ```bash
-python ../scripts/recovery.py record-failure   # 本轮失败 +1
-python ../scripts/recovery.py status           # 查看当前轮数
-python ../scripts/recovery.py record-success   # 修复成功后清零
-python ../scripts/recovery.py reset            # 手动清零
+python scripts/safecode.py security scan --staged
 ```
 
-`MAX_RECOVERY_ATTEMPTS = 3`。连续失败达到 3 轮：立即停止修改，不允许 Push，由 `recovery.py` 生成 `.safecode/diagnostic-report.md`，并请求人工确认。不要陷入改坏→修坏循环。
+只看**本次准备提交的内容**。有阻断 finding 就不要提交。
 
-错误等级与对应行为见 `../rules/recovery.md`：
+发现真实凭据时不要只删文件里的字符串：**先 Revoke / Rotate 凭据**，
+再评估是否需要清理历史（历史改写是 HIGH RISK，必须人工确认）。
 
-- L0 正常 / L1 普通测试失败（自动修复） / L2 编译失败（定位修复） / L3 环境异常（尝试恢复） / L4 工作区异常（停并恢复 checkpoint）
-- **L5 安全风险：立即停止，不得继续**
-- **L6 无法确定：停止并请求人工确认**
-
-## Security Scan（Push 前必跑）
+需要保留某个已知、已审计的结果时，写 Baseline 或 `allow_list`，带 reason：
 
 ```bash
-python ../scripts/security-scan.py --staged --json
+python scripts/safecode.py security baseline --reason "audited test fixture"
 ```
 
-扫描待提交内容中的 Secret（API key/token/cookie/session/私钥/`.pem`/`.key`/`.env`/数据库凭据/Bilibili `SESSDATA`、`bili_jct` 等）。退出码 0=通过、1=有发现、2=错误。
+Check 无法完成（Scanner 缺失、超时、输出无法解析、shallow 仓库扫不了历史）
+不是 PASS，不要把它当成"没问题"。
 
-规则与降误报策略见 `../rules/security.md`。要点：
-
-- 结合字段名、值格式、高熵、是否测试文件、是否明显占位符（`YOUR_API_KEY_HERE`/`example-token`/`test-secret`）判断，不把出现 `token`/`key`/`password` 字样的一律判泄露。
-- 发现真实凭据：立即阻止 Push；仅工作区的删除/替换，已进 Git 的先撤销或轮换凭据再谈清历史。
-- **L5 一律停止。**
-
-## Review Diff
+### 7. Review Diff
 
 ```bash
-git diff
-git diff --cached
+python scripts/safecode.py dependency check
+python scripts/safecode.py git guard --check-diff
 ```
 
-确认本次只有预期改动，检查新增文件是否夹带凭据、大文件或意外产物。配合 `../rules/git.md` 的 Push 前检查链自查：工作区状态 → 分支 → Diff → 新增文件 → 测试 → 安全扫描 → 无危险操作。
+确认清单：只改了预期文件；没有顺手带进 `.env`、私钥、大二进制；
+依赖变化与 manifest 一致；没有危险命令被写进脚本；删除量和影响面在预期内。
 
-## Push
-
-推送前跑总门禁（也可挂 `git-guard.py --pre-push` 到 pre-push hook）：
+### 8. Push
 
 ```bash
-python ../scripts/git-guard.py --pre-push
-python ../scripts/pre-push.py
+python scripts/safecode.py pre-push
 ```
 
-`pre-push.py` 会依次验证：状态 → 分支 → Diff → 新增文件 → 测试 → 安全扫描 → 允许 Push。
+它串联 Diff 检查、安全扫描、依赖检查、测试与 Git Guard，由 Decision Resolver 汇总。
+只有 Effective Decision 为 `ALLOW` 才允许 Push：
 
-以下高危操作**未获用户明确授权不得自动执行**（见 `../rules/git.md`）：
+```
+Effective Decision = ALLOW
++ 所有 Required Gate PASS
++ 无未授权 Hard Stop
++ Git Guard ALLOW
+```
 
-- `git push --force` / `--force-with-lease`
-- 删除或改写 Git 历史（`reset --hard` 到未知提交、`filter-branch`、改写已推送历史等）
-- 删除大量项目文件
-- 改生产环境、上传私人数据、把本地服务暴露公网
+被拒绝时的退出码：`1` 发现问题或需要授权、`2` 参数/配置错误、`3` 工具失败、`4` 环境异常。
 
-任何拿不准的情况，停止并请求人工确认。L5/L6 不得自行猜测后继续。
+需要人工授权的操作走令牌流程：请求授权 -> 拿到一次性 token ->
+验证 operation fingerprint 匹配且未过期 -> 重放同一个操作。
+
+不要用 `git push --no-verify` 绕过；它不会让 CI 变成 PASS，只会被记录成绕过事件。
+
+### 9. CI 再验证
+
+Push 之后还有两道防线：CI（`test` / `security` / `dependency`）与分支保护
+（Required status checks）。本地 hook 可以被删除，CI 不能；CI 通过但没配成
+Required check，也挡不住直接 merge。CI 红了就是没通过——它和本地 Gates 是同一套
+判定的独立执行，不是"再确认一下"。
+
+## 硬性要求
+
+- 不放行任何"无法确认"的情况；检查无法完成一律不 PASS。
+- 退出码非 0 不得被解释为通过；JSON 与退出码冲突时取更严格的一方。
+- `DEGRADED` 不是 PASS；CI / `--strict` 下 `DEGRADED` 就是 DENY。
+- `L5` / `L6` 不允许 Agent 自行猜测后继续。
+- 不得修改 `.safecode.yml` 来关闭核心不变量（被禁止的组合会直接判配置非法）。
+- 不得用 `--no-verify`、删 hook、改配置等方式"绕过一次检查"。

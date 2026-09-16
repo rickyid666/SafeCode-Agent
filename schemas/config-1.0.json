@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://safecode.dev/schema/config-1.0.json",
+  "title": "SafeCode Configuration",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {"enum": ["default", "strict"]},
+        "native": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"const": true}
+          }
+        },
+        "external_scanners": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "required_in_ci": {"type": "boolean"},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "tools": {
+              "type": "array",
+              "items": {"enum": ["gitleaks", "trufflehog", "detect-secrets"]}
+            }
+          }
+        },
+        "ignore_paths": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(^|/)\\.git(/|$)).+$"}
+        },
+        "allow_list": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["rule", "path", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "rule": {"type": "string", "minLength": 1, "pattern": "^(?!\\*$)[A-Za-z0-9_.:-]+$"},
+              "path": {"type": "string", "minLength": 1},
+              "reason": {"type": "string", "minLength": 1},
+              "finding_type": {"type": "string", "minLength": 1},
+              "fingerprint": {"type": "string", "minLength": 8},
+              "expires": {"type": "string", "minLength": 4}
+            }
+          }
+        },
+        "custom_rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "pattern"],
+            "additionalProperties": true,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "pattern": {"type": "string", "minLength": 1},
+              "severity": {"enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+              "description": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "testing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "flaky_detection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "reruns": {"type": "integer", "minimum": 0, "maximum": 10}
+          }
+        },
+        "targets": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_recovery_attempts": {"type": "integer", "minimum": 1},
+        "max_total_test_runs": {"type": "integer", "minimum": 1},
+        "max_total_recoveries": {"type": "integer", "minimum": 1},
+        "max_total_time": {"type": "string", "pattern": "^[0-9]+(s|m|h)$"}
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protected_branches": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "require_pre_push_hook": {"type": "boolean"},
+        "require_ci": {"type": "boolean"},
+        "allow_force_push": {"type": "boolean"},
+        "allow_history_rewrite": {"type": "boolean"}
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "bootstrap_mode": {"type": "boolean"},
+        "self_hosting": {"type": "boolean"}
+      }
+    }
+  }
+}

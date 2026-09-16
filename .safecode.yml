@@ -1,0 +1,44 @@
+schema_version: "1.0"
+
+security:
+  mode: default
+  native:
+    enabled: true
+  external_scanners:
+    enabled: true
+    required_in_ci: true
+    timeout_seconds: 120
+    tools:
+      - gitleaks
+      - trufflehog
+      - detect-secrets
+  ignore_paths: []
+  allow_list: []
+  custom_rules: []
+
+testing:
+  flaky_detection:
+    enabled: true
+    reruns: 3
+  targets:
+    - tests
+
+recovery:
+  max_recovery_attempts: 3
+  max_total_test_runs: 20
+  max_total_recoveries: 10
+  max_total_time: 30m
+
+git:
+  protected_branches:
+    - main
+    - master
+  require_pre_push_hook: true
+  require_ci: true
+  allow_force_push: false
+  allow_history_rewrite: false
+
+project:
+  name: "SafeCode-Agent"
+  bootstrap_mode: false
+  self_hosting: true

@@ -1,70 +1,94 @@
-# 失败自救流程与错误等级
+# rules/recovery.md — 自救规则（软约束）
 
-本规则约束 SafeCode Agent 在测试失败后的自愈行为，以及统一的错误等级划分。
+测试或构建失败时，Agent 应该尝试自救，但自救是有预算的、有上限的、可审计的。
 
-## 自愈流程
-
-测试失败**不允许立即 Push**。标准流程：
-
-```text
-测试失败
- ↓
-读取完整错误
- ↓
-分类
- ├─ 编译错误
- ├─ 测试断言错误
- ├─ 依赖错误
- ├─ 环境错误
- ├─ 真实 Bug
- └─ 无法确定
- ↓
-尝试修复
- ↓
-重新测试
+```
+失败
+ -> 读取完整错误信息
+ -> 解析 Structured JSON（不要正则去啃自然语言日志）
+ -> 分类
+ -> 定位原因
+ -> 修改
+ -> 重新测试
 ```
 
-分类后按等级决定能否自动修（见下表）。能修就修，修完重测；修不动或拿不准就停止。
+## 错误分类
 
-## 最大重试次数
-
-```text
-MAX_RECOVERY_ATTEMPTS = 3
+```
+L0  Normal                 正常，继续
+L1  Test Failure           测试失败，可在预算内自动修复
+L2  Build Failure          构建失败，可在预算内自动修复
+L3  Environment / Dependency  环境或依赖问题，可尝试恢复；无法恢复则停止
+L4  Workspace Abnormal     工作区异常，停止并恢复
+L5  Security Risk          安全风险，立即 Hard Stop
+L6  Unknown / Dangerous    无法确认影响，Hard Stop 并请求人工授权
 ```
 
-连续失败达到上限后：**停止修改，不允许 Push，并输出诊断报告。** 目的是避免 Agent 陷入“改坏 → 修坏 → 再改坏 → 再修坏”的死循环。
+等级不是给 Agent 自由发挥的建议，而是 Policy Engine 的输入：
 
-诊断报告由 `scripts/recovery.py` 在达到上限时生成：
-
-```bash
-python scripts/recovery.py record-failure   # 本轮失败 +1
-python scripts/recovery.py status           # 查看当前轮数
-python scripts/recovery.py record-success   # 修复成功后清零
-python scripts/recovery.py reset            # 手动清零
+```
+L0 -> ALLOW
+L1 -> RECOVER
+L2 -> RECOVER
+L3 -> RECOVER / STOP
+L4 -> STOP
+L5 -> HARD STOP
+L6 -> HARD STOP + HUMAN APPROVAL
 ```
 
-连续 3 轮失败后，`recovery.py` 拒绝继续记录并生成 `.safecode/diagnostic-report.md`，内容应包含：失败轮数、每轮错误摘要、最后已知状态、工作区 Diff、建议的人工排查方向。Agent 应把该报告交给人确认，而不是自己接着改。
+`L5` 不得通过普通对话自动绕过；`L6` 默认 `REQUIRE_APPROVAL`，操作本身不可授权时才 DENY。
+`UNKNOWN` 表示无法确认，不表示安全。
 
-## 错误等级表
+## 预算
 
-| 等级 | 情况 | Agent 行为 |
-|---|---|---|
-| L0 | 正常 | 继续 |
-| L1 | 普通测试失败 | 自动修复 |
-| L2 | 编译 / 构建失败 | 自动定位并修复 |
-| L3 | 环境 / 依赖异常 | 尝试恢复 |
-| L4 | 工作区异常 | 停止并恢复 checkpoint |
-| L5 | 安全风险 | 立即停止 |
-| L6 | 无法确定 | 停止并请求确认 |
+单个错误的连续重试次数不够，必须有全局预算：
 
-## 各等级 Agent 行为说明
+```
+MAX_RECOVERY_ATTEMPTS = 3      单任务连续失败上限
+MAX_TOTAL_TEST_RUNS   = 20     累计测试运行次数
+MAX_TOTAL_RECOVERIES  = 10     累计自救次数
+MAX_TOTAL_TIME        = 30m    累计耗时
+```
 
-- **L0**：一切正常，继续原流程。
-- **L1**：普通测试失败，读取错误后自动修复并重测，计入自救轮数。
-- **L2**：编译或构建失败，定位到具体文件/依赖，自动修复；修不动计入 L1 类轮数。
-- **L3**：环境或依赖异常（缺包、版本错、网络），尝试恢复（安装/切换环境）；无法恢复则升级处理。
-- **L4**：工作区异常（状态冲突、未知改动、分支错位），停止并恢复到修改前记录的 checkpoint 或临时分支。
-- **L5**：安全风险（如安全扫描发现真实凭据），立即停止，不得继续任何修改或 Push，按 `rules/security.md` 处理。
-- **L6**：无法确定的问题，停止并请求人工确认；**L5 / L6 不允许 Agent 自行猜测后继续。**
+计数口径要说清楚：
 
-达到 `MAX_RECOVERY_ATTEMPTS` 上限且仍是失败状态时，无论原等级如何，统一按“停止 + 输出诊断报告 + 请求人工确认”处理。
+- **一次 Recovery**：针对一次已识别的失败原因采取修复动作，并进入下一次验证尝试。
+- 单纯重跑同一个测试、没有修复动作，**不算 Recovery**，但仍然计入 `MAX_TOTAL_TEST_RUNS`。
+- Flaky 检测需要的 rerun 只消耗 Test Budget。
+
+```
+Test #1 FAIL -> 修复 -> Recovery #1 -> Test #2 FAIL -> 修复 -> Recovery #2 -> Test #3
+= 3 test runs, 2 recoveries
+```
+
+预算耗尽时：
+
+```
+停止自动恢复 -> 生成诊断报告 -> 人工介入
+```
+
+不允许"单个环节都没超限，整体跑了好几个小时"。
+
+## 预算必须持久化
+
+```
+.safecode/state/<task-id>.json
+```
+
+记录 `test_runs`、`recoveries`、`elapsed_seconds`、`consecutive_failures`、
+`last_result_code`、完整 history。
+
+Agent 重启、Session 切换、工具重新调用，都不能靠重启进程把预算归零。
+状态文件要防并发丢更新（更新在锁内读-改-写），损坏时 Fail-Closed，不允许静默重建。
+
+## 什么时候必须停手
+
+- 连续失败达到 `MAX_RECOVERY_ATTEMPTS`
+- 任一全局预算耗尽
+- 判定为 `FLAKY_TEST` 或 `ENVIRONMENT`（这两类不该去改业务代码）
+- 出现 L5 / L6
+- 状态文件损坏、无法确认当前预算
+
+停下时要输出诊断报告（`.safecode/diagnostic-report.md`）：任务 ID、起止时间、
+累计计数、按等级分布、历次失败摘要，以及明确的一句"已达到最大自救轮数/预算耗尽，
+停止修改，禁止 Push，需人工介入"。

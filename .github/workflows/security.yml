@@ -1,25 +1,47 @@
-name: Security Scan (self)
+name: Security
+
+# 第二道防线。CI 等价于 STRICT 模式：外部 Scanner 缺失或异常都算检查未完成 -> DENY。
+# 因此这里显式安装一个真实的外部 Scanner，而不是让 native 规则独自顶班。
 
 on:
   push:
-    branches: ["**"]
   pull_request:
-    branches: ["**"]
+
+permissions:
+  contents: read
 
 jobs:
-  security-scan:
-    name: Scan own repo for secrets
+  security:
+    name: security
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.11"
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
-      - name: Scan repository for leaked secrets
-        # eat-your-own-dog-food：用自带的扫描器扫自身。
-        # 退出码非 0（发现泄露）会让该步骤失败，从而阻断 job。
-        run: python scripts/security-scan.py --all
+      - name: Install external secret scanner
+        # detect-secrets 通过 PyPI 安装，比下载 release 资产稳定
+        run: python -m pip install --upgrade pip detect-secrets
+
+      - name: Native + external secret scan (strict)
+        run: python scripts/security-scan.py --all --strict
+
+      - name: Git history scan (first-adoption coverage)
+        # 首次接入要求覆盖完整历史；shallow 仓库在这里必须 Fail-Closed
+        run: python scripts/security-scan.py --history --strict
+
+  dependency:
+    name: dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Dependency / supply chain gate
+        run: python scripts/dependency-guard.py --scope all --strict

@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "entries": [
+    {
+      "fingerprint": "sha256:7bb46c1aec670168609ce46c0429637ccfacf23043c5b0841686af82833358e4",
+      "rule": "openai-style-key",
+      "path": "tests/test_security.py",
+      "finding_type": "secret",
+      "reason": "synthetic fixture values in the v1 test suite (commit 7896c63); replaced by runtime-assembled fixtures in the v7 rewrite, no real credential involved",
+      "created_at": "2026-09-15T23:52:16Z"
+    },
+    {
+      "fingerprint": "sha256:49d14af8c919c584254634c9cd505a4b9ea9202b9024306763a33127e5f9e743",
+      "rule": "generic-secret-assignment",
+      "path": "tests/test_security.py",
+      "finding_type": "secret",
+      "reason": "synthetic fixture values in the v1 test suite (commit 7896c63); replaced by runtime-assembled fixtures in the v7 rewrite, no real credential involved",
+      "created_at": "2026-09-15T23:52:16Z"
+    },
+    {
+      "fingerprint": "sha256:47f9f1f1c19faf0eefcdad747167ea60c898e8f6e7c163cbc8b52b5ccf5e7f66",
+      "rule": "bilibili-sessdata",
+      "path": "tests/test_security.py",
+      "finding_type": "secret",
+      "reason": "synthetic fixture values in the v1 test suite (commit 7896c63); replaced by runtime-assembled fixtures in the v7 rewrite, no real credential involved",
+      "created_at": "2026-09-15T23:52:16Z"
+    },
+    {
+      "fingerprint": "sha256:4efe39aad368ad3dad8692d0ccbb5b184b172d6dcb3b7ecc88dac6adadbc74ea",
+      "rule": "pem-private-key-block",
+      "path": "tests/test_security.py",
+      "finding_type": "secret",
+      "reason": "synthetic fixture values in the v1 test suite (commit 7896c63); replaced by runtime-assembled fixtures in the v7 rewrite, no real credential involved",
+      "created_at": "2026-09-15T23:52:16Z"
+    }
+  ]
+}

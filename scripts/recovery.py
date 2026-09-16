@@ -1,272 +1,296 @@
 #!/usr/bin/env python3
-"""SafeCode Agent — 自救（recovery）状态机。
-
-跟踪连续失败次数，达到上限（默认 3 轮）即停止修改、禁止 Push，并生成诊断报告。
+"""SafeCode Recovery CLI —— Persistent Budget + Recovery 工作流入口。
 
 子命令：
-    record-failure [--level L1] [--summary "..."]
-        失败计数 +1，写入状态文件；若达到上限或等级为 L5/L6，立即拒绝（退出码 10）
-        并生成 .safecode/diagnostic-report.md。
-    record-success
-        清零连续失败计数（记录一次成功）。
-    status
-        打印当前计数与剩余额度。
-    reset
-        清零（等同于 record-success，但不写成功历史）。
+- record-failure 记录一次失败（--type test_run|recovery，默认 recovery）
+- record-success 记录恢复成功（consecutive_failures 归零）
+- status        输出当前预算计数与剩余额度
+- reset         清空状态（--task-id 或 --all）
+- report        打印已有诊断报告路径与内容摘要
 
-状态文件：<repo-root>/.safecode/recovery-state.json
-    字段： consecutive_failures, max_attempts, history[]
+退出码契约：
+- 0  正常（失败在预算内、允许继续 / 成功 / status / reset / report）
+- 1  发现明确问题或需人工授权（预算耗尽 → DENY；L5 → DENY；L6 → REQUIRE_APPROVAL）
+- 2  参数 / 配置错误
+- 4  环境异常（状态损坏 / 锁超时）
 
-最大自救轮数：默认 3，可用 --max-attempts 覆盖；环境变量
-SAFECODE_MAX_RECOVERY_ATTEMPTS 优先级最高。
-
-退出码：
-    0  正常（未达上限）
-    10 达到自救上限 / L5/L6 立即上限（拒绝继续）
-    2  用法错误 / 内部错误
+stdout 只输出一个 Structured JSON 对象；人类日志一律走 stderr（--json 时静默）。
+纯 Python 标准库，跨平台。Python >= 3.10。
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import safecode_common as sc
+import safecode_config as cfg
+import safecode_budget as budget
 
-DEFAULT_MAX_ATTEMPTS = 3
-STATE_DIRNAME = ".safecode"
-STATE_FILE = "recovery-state.json"
-DIAG_FILE = "diagnostic-report.md"
-
-
-def state_dir() -> str:
-    """状态目录：优先 git 仓库根，回退当前目录。"""
-    root = sc.repo_root()
-    base = root or os.getcwd()
-    return os.path.join(base, STATE_DIRNAME)
+# 风险等级（来自 safecode_common）
+L5 = sc.L5
+L6 = sc.L6
+L4 = sc.L4
+L3 = sc.L3
 
 
-def state_path() -> str:
-    return os.path.join(state_dir(), STATE_FILE)
+# --------------------------------------------------------------------------- #
+# CLI 参数
+# --------------------------------------------------------------------------- #
 
-
-def diagnostic_path() -> str:
-    return os.path.join(state_dir(), DIAG_FILE)
-
-
-def effective_max_attempts(override: int | None) -> int:
-    env_val = os.environ.get("SAFECODE_MAX_RECOVERY_ATTEMPTS", "").strip()
-    if env_val and env_val.isdigit():
-        return int(env_val)
-    if override is not None:
-        return override
-    return DEFAULT_MAX_ATTEMPTS
-
-
-def load_state(path: str, max_attempts: int) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            data.setdefault("consecutive_failures", 0)
-            data.setdefault("max_attempts", max_attempts)
-            data.setdefault("history", [])
-            return data
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"consecutive_failures": 0, "max_attempts": max_attempts, "history": []}
-
-
-def save_state(path: str, state: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2, ensure_ascii=False)
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def generate_diagnostic(state: dict) -> str:
-    """生成诊断报告，返回文件路径。"""
-    history = state.get("history", [])
-    # 错误等级分布
-    dist: dict = {}
-    for h in history:
-        lvl = h.get("level", "UNKNOWN")
-        dist[lvl] = dist.get(lvl, 0) + 1
-
-    lines = []
-    lines.append("# SafeCode 自救诊断报告")
-    lines.append("")
-    lines.append(f"- 生成时间: {now_iso()}")
-    lines.append(f"- 连续失败次数: {state.get('consecutive_failures', 0)}")
-    lines.append(f"- 最大自救轮数: {state.get('max_attempts', DEFAULT_MAX_ATTEMPTS)}")
-    lines.append("")
-    lines.append("## 结论")
-    lines.append("")
-    lines.append("> **已达到最大自救轮数，停止修改，禁止 Push，请人工介入。**")
-    lines.append("")
-    lines.append("Agent 已连续尝试修复但未能通过，继续修改可能导致更多破坏。"
-                 "请勿自动 Push，等待人工排查与处理。")
-    lines.append("")
-    lines.append("## 错误等级分布")
-    lines.append("")
-    if dist:
-        for lvl, cnt in sorted(dist.items(), key=lambda x: -x[1]):
-            lines.append(f"- {lvl} ({sc.error_level_meaning(lvl)}): {cnt} 次")
-    else:
-        lines.append("- 无记录")
-    lines.append("")
-    lines.append("## 历次失败摘要")
-    lines.append("")
-    if history:
-        for i, h in enumerate(history, 1):
-            ts = h.get("timestamp", "?")
-            lvl = h.get("level", "?")
-            summary = h.get("summary", "")
-            lines.append(f"{i}. `[{ts}]` **{lvl}** — {summary}")
-    else:
-        lines.append("- 无记录")
-    lines.append("")
-    lines.append("## 建议排查方向")
-    lines.append("")
-    lines.append("- 查看上方历次失败摘要，定位反复出现的根因（依赖 / 编译 / 断言 / 环境）。")
-    lines.append("- 对比最近一次成功提交（`git log` / `git diff`），确认引入的变更范围。")
-    lines.append("- 如为 L5/L6：极可能是安全风险或无法确定，务必人工确认，切勿猜测后继续。")
-    lines.append("- 考虑恢复到上一个已知安全状态（`git stash` / 临时分支 / checkpoint）。")
-    lines.append("- 修复后重新运行测试与安全扫描；通过后再考虑提交与 Push。")
-    lines.append("")
-
-    content = "\n".join(lines)
-    path = diagnostic_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-    return path
-
-
-def cmd_record_failure(args) -> int:
-    max_attempts = effective_max_attempts(args.max_attempts)
-    path = state_path()
-    state = load_state(path, max_attempts)
-    state["max_attempts"] = max_attempts
-
-    level = args.level or sc.L1
-    summary = args.summary or ""
-
-    state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
-    state.setdefault("history", []).append({
-        "timestamp": now_iso(),
-        "level": level,
-        "summary": summary,
-    })
-
-    # 是否立即达到上限语义：连续失败达上限，或等级为 L5/L6
-    reached_limit = (
-        state["consecutive_failures"] >= max_attempts
-        or level in (sc.L5, sc.L6)
-    )
-
-    if reached_limit:
-        save_state(path, state)
-        diag = generate_diagnostic(state)
-        print(sc.colorize("SafeCode recovery: 已达到最大自救轮数，停止修改，禁止 Push。", "red"))
-        print(f"连续失败: {state['consecutive_failures']}/{max_attempts}"
-              + (f"（等级 {level} 触发立即上限）" if level in (sc.L5, sc.L6) else ""))
-        print(f"诊断报告: {diag}")
-        print("请人工介入，移除/修复问题后重新评估，不要自动继续修改或 Push。")
-        return sc.EXIT_RECOVERY_LIMIT
-
-    save_state(path, state)
-    remaining = max_attempts - state["consecutive_failures"]
-    print(sc.colorize(f"已记录一次失败（{level}）。剩余自救额度: {remaining}/{max_attempts}。", "yellow"))
-    return sc.EXIT_PASS
-
-
-def cmd_record_success(args) -> int:
-    max_attempts = effective_max_attempts(args.max_attempts)
-    path = state_path()
-    state = load_state(path, max_attempts)
-    state["consecutive_failures"] = 0
-    state["max_attempts"] = max_attempts
-    save_state(path, state)
-    print(sc.colorize("已记录一次成功，连续失败计数清零。", "green"))
-    return sc.EXIT_PASS
-
-
-def cmd_status(args) -> int:
-    max_attempts = effective_max_attempts(args.max_attempts)
-    path = state_path()
-    state = load_state(path, max_attempts)
-    cf = state.get("consecutive_failures", 0)
-    remaining = max(0, max_attempts - cf)
-    print(f"连续失败次数: {cf}")
-    print(f"最大自救轮数: {max_attempts}")
-    print(f"剩余额度: {remaining}")
-    print(f"状态文件: {path}")
-    return sc.EXIT_PASS
-
-
-def cmd_reset(args) -> int:
-    max_attempts = effective_max_attempts(args.max_attempts)
-    path = state_path()
-    state = load_state(path, max_attempts)
-    state["consecutive_failures"] = 0
-    state["max_attempts"] = max_attempts
-    save_state(path, state)
-    print(sc.colorize("自救计数已重置。", "green"))
-    return sc.EXIT_PASS
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    sc.add_common_arguments(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="recovery.py",
-        description="SafeCode 自救状态机（连续失败上限控制）",
+        description="SafeCode Persistent Budget + Recovery CLI",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_fail = sub.add_parser("record-failure", help="记录一次失败（计数 +1）")
-    p_fail.add_argument("--level", default=sc.L1,
-                        choices=sc.ERROR_LEVELS,
-                        help="本次失败的错误等级（默认 L1）")
-    p_fail.add_argument("--summary", default="", help="失败摘要文本")
-    p_fail.add_argument("--max-attempts", type=int, default=None,
-                        help="覆盖最大自救轮数（环境变量 SAFECODE_MAX_RECOVERY_ATTEMPTS 优先）")
+    p = sub.add_parser("record-failure", help="记录一次失败并更新预算")
+    _add_common(p)
+    p.add_argument("--type", choices=["test_run", "recovery"], default="recovery",
+                   help="失败类型（默认 recovery）")
+    p.add_argument("--level", default="L1", help="错误等级 L0..L6（默认 L1）")
+    p.add_argument("--code", default="ASSERTION_FAILURE", help="结果代码")
+    p.add_argument("--summary", default="", help="失败摘要")
+    p.add_argument("--duration", type=float, default=0, help="本次耗时（秒）")
 
-    p_ok = sub.add_parser("record-success", help="记录一次成功（清零）")
-    p_ok.add_argument("--max-attempts", type=int, default=None)
+    p = sub.add_parser("record-success", help="记录恢复成功")
+    _add_common(p)
+    p.add_argument("--code", default="RECOVERY_SUCCESS", help="结果代码")
+    p.add_argument("--summary", default="", help="摘要")
+    p.add_argument("--level", default="L0", help="错误等级（默认 L0）")
+    p.add_argument("--duration", type=float, default=0, help="本次耗时（秒）")
 
-    p_st = sub.add_parser("status", help="打印当前计数与剩余额度")
-    p_st.add_argument("--max-attempts", type=int, default=None)
+    p = sub.add_parser("status", help="输出当前预算状态")
+    _add_common(p)
 
-    p_rs = sub.add_parser("reset", help="清零计数")
-    p_rs.add_argument("--max-attempts", type=int, default=None)
+    p = sub.add_parser("reset", help="清空预算状态")
+    _add_common(p)
+    p.add_argument("--all", action="store_true", help="清空所有 task 状态")
+
+    p = sub.add_parser("report", help="打印已有诊断报告")
+    _add_common(p)
 
     return parser
 
 
-def main(argv=None) -> int:
-    parser = build_parser()
+def _resolve_root() -> str:
+    return sc.repo_root(os.getcwd()) or os.getcwd()
+
+
+def resolve_task_id(args: argparse.Namespace, root: str) -> Optional[str]:
+    if getattr(args, "task_id", None):
+        return args.task_id
+    env = os.environ.get("SAFECODE_TASK_ID")
+    if env:
+        return env
+    cur = budget.get_current_task(root)
+    return cur or None
+
+
+# --------------------------------------------------------------------------- #
+# 子命令实现（返回 (Result, exit_code)）
+# --------------------------------------------------------------------------- #
+
+def cmd_record_failure(args: argparse.Namespace, root: str, limits: Dict[str, Any]
+                       ) -> Tuple[sc.Result, int]:
+    task_id = resolve_task_id(args, root)
+    if not task_id:
+        return sc.usage_error_result("MISSING_TASK_ID",
+                                      "record-failure requires --task-id (or SAFECODE_TASK_ID / current)"), sc.EXIT_USAGE
+    budget.set_current_task(task_id, root)
+
+    level = args.level
+    # L5 / L6 立即 Hard Stop：不消耗任何预算
+    if level == L5:
+        return sc.fail_deny_result(
+            "HARD_STOP_SECURITY",
+            "Security risk (L5): immediate hard stop, recovery denied.",
+            severity=sc.SEVERITY_CRITICAL, category=sc.CATEGORY_RECOVERY), sc.EXIT_FINDING
+    if level == L6:
+        return sc.approval_result(
+            "HARD_STOP_UNKNOWN",
+            "Unknown / dangerous (L6): hard stop and require human approval.",
+            category=sc.CATEGORY_RECOVERY), sc.EXIT_FINDING
+
+    # 正常记录（在文件锁内读-改-写）
+    if args.type == "test_run":
+        state = budget.record_test_run(task_id, root=root, level=level, code=args.code,
+                                       summary=args.summary, duration_seconds=args.duration, limits=limits)
+    else:
+        state = budget.record_recovery(task_id, root=root, level=level, code=args.code,
+                                       summary=args.summary, duration_seconds=args.duration, limits=limits)
+
+    reason = budget.check_exhausted(state, limits)
+    if reason:
+        report_path = budget.write_diagnostic_report(state, limits, root=root, reason=reason)
+        result = sc.fail_deny_result(
+            "BUDGET_EXHAUSTED",
+            f"Recovery budget exhausted: {reason}. Stop modifying, do not push, human intervention required.",
+            category=sc.CATEGORY_RECOVERY)
+        result.metadata["diagnostic_report"] = report_path
+        result.metadata["budget"] = budget.budget_report(state, limits)
+        return result, sc.EXIT_FINDING
+
+    # L4：工作区异常，立即停止恢复（预算内也停）
+    if level == L4:
+        report_path = budget.write_diagnostic_report(state, limits, root=root, reason="workspace abnormal: stop and recover")
+        result = sc.fail_deny_result(
+            "WORKSPACE_ABNORMAL",
+            "Workspace abnormal (L4): stop and recover.",
+            category=sc.CATEGORY_RECOVERY)
+        result.metadata["diagnostic_report"] = report_path
+        result.metadata["budget"] = budget.budget_report(state, limits)
+        return result, sc.EXIT_FINDING
+
+    # L1 / L2 / L3：预算内允许继续恢复
+    if level == L3:
+        hint = "Environment/dependency (L3): attempt recovery; if unrecoverable, stop."
+    else:
+        hint = "Recovery allowed within budget."
+    result = sc.pass_result("RECOVERY_ALLOWED", hint, category=sc.CATEGORY_RECOVERY)
+    result.metadata["budget"] = budget.budget_report(state, limits)
+    if level == L3:
+        result.metadata["recover_hint"] = "recover if possible, else stop"
+    return result, sc.EXIT_OK
+
+
+def cmd_record_success(args: argparse.Namespace, root: str, limits: Dict[str, Any]
+                       ) -> Tuple[sc.Result, int]:
+    task_id = resolve_task_id(args, root)
+    if not task_id:
+        return sc.usage_error_result("MISSING_TASK_ID",
+                                      "record-success requires --task-id (or SAFECODE_TASK_ID / current)"), sc.EXIT_USAGE
+    budget.set_current_task(task_id, root)
+
+    state = budget.record_success(task_id, root=root, level=args.level, code=args.code,
+                                  summary=args.summary, duration_seconds=args.duration, limits=limits)
+    result = sc.pass_result("RECOVERY_SUCCESS",
+                            "Recovery succeeded: consecutive failures reset.",
+                            category=sc.CATEGORY_RECOVERY)
+    result.metadata["budget"] = budget.budget_report(state, limits)
+    return result, sc.EXIT_OK
+
+
+def cmd_status(args: argparse.Namespace, root: str, limits: Dict[str, Any]
+               ) -> Tuple[sc.Result, int]:
+    task_id = resolve_task_id(args, root)
+    if not task_id:
+        return sc.usage_error_result("MISSING_TASK_ID",
+                                      "status requires --task-id (or SAFECODE_TASK_ID / current)"), sc.EXIT_USAGE
+    state = budget.load_state(task_id, root=root)
+    report = budget.budget_report(state, limits)
+    result = sc.pass_result("BUDGET_STATUS", "Current recovery budget state.",
+                            category=sc.CATEGORY_RECOVERY)
+    result.metadata["task_id"] = task_id
+    result.metadata["budget"] = report
+    result.metadata["state"] = {
+        "task_id": state.get("task_id", task_id),
+        "started_at": state.get("started_at", ""),
+        "updated_at": state.get("updated_at", ""),
+        "last_result_code": state.get("last_result_code", ""),
+    }
+    return result, sc.EXIT_OK
+
+
+def cmd_reset(args: argparse.Namespace, root: str, limits: Dict[str, Any]
+              ) -> Tuple[sc.Result, int]:
+    if not args.all and not args.task_id:
+        return sc.usage_error_result("MISSING_TARGET",
+                                      "reset requires --task-id or --all"), sc.EXIT_USAGE
+    if args.all:
+        state_dir = budget.state_dir(root)
+        removed = 0
+        if os.path.isdir(state_dir):
+            for name in os.listdir(state_dir):
+                if name.endswith(".json") or name == "current":
+                    try:
+                        os.remove(os.path.join(state_dir, name))
+                        removed += 1
+                    except OSError:
+                        pass
+        result = sc.pass_result("BUDGET_RESET",
+                                f"Reset all budget states (removed {removed} file(s)).",
+                                category=sc.CATEGORY_RECOVERY)
+        return result, sc.EXIT_OK
+    budget.reset_state(args.task_id, root=root)
+    result = sc.pass_result("BUDGET_RESET",
+                            f"Reset budget state for task {args.task_id}.",
+                            category=sc.CATEGORY_RECOVERY)
+    return result, sc.EXIT_OK
+
+
+def cmd_report(args: argparse.Namespace, root: str, limits: Dict[str, Any]
+               ) -> Tuple[sc.Result, int]:
+    path = budget.diagnostic_report_path(root)
+    if os.path.isfile(path):
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError as exc:
+            text = ""
+            path_str = ""
+        else:
+            path_str = path
+        result = sc.pass_result("BUDGET_REPORT", "Diagnostic report found.",
+                                category=sc.CATEGORY_RECOVERY)
+        result.metadata["report_path"] = path_str
+        result.metadata["report_summary"] = (text[:800] if text else "")
+    else:
+        result = sc.pass_result("BUDGET_REPORT", "No diagnostic report found.",
+                                category=sc.CATEGORY_RECOVERY)
+        result.metadata["report_path"] = None
+    return result, sc.EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# 入口
+# --------------------------------------------------------------------------- #
+
+_DISPATCH = {
+    "record-failure": cmd_record_failure,
+    "record-success": cmd_record_success,
+    "status": cmd_status,
+    "reset": cmd_reset,
+    "report": cmd_report,
+}
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = build_parser().parse_args(argv)
+    reporter = sc.reporter_from_args(args)
+    root = _resolve_root()
+
+    # 配置（.safecode.yml）加载失败 → 配置错误 exit 2
     try:
-        args = parser.parse_args(argv)
-    except SystemExit:
+        config = cfg.load_config(getattr(args, "config", None), cwd=os.getcwd())
+    except cfg.ConfigError as exc:
+        result = sc.usage_error_result(exc.code, exc.message)
+        reporter.emit_json(result.to_dict())
         return sc.EXIT_USAGE
 
-    handlers = {
-        "record-failure": cmd_record_failure,
-        "record-success": cmd_record_success,
-        "status": cmd_status,
-        "reset": cmd_reset,
-    }
     try:
-        return handlers[args.command](args)
-    except Exception as exc:  # noqa: BLE001
-        print(f"错误: recovery 内部错误: {exc}", file=sys.stderr)
-        return sc.EXIT_USAGE
+        limits = config.budget_limits
+        handler = _DISPATCH.get(args.command)
+        if handler is None:
+            result = sc.usage_error_result("UNKNOWN_COMMAND", f"unknown command: {args.command}")
+            code = sc.EXIT_USAGE
+        else:
+            result, code = handler(args, root, limits)
+    except budget.BudgetError as exc:
+        # 状态损坏 / 锁超时 → 环境异常 exit 4
+        result = sc.env_error_result(exc.code, str(exc))
+        code = sc.EXIT_ENV
+
+    reporter.emit_json(result.to_dict())
+    return code
 
 
 if __name__ == "__main__":

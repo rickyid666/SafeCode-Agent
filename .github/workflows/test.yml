@@ -1,34 +1,39 @@
 name: Tests
 
+# 第二道防线：本地 hook 可以被删除、可以用 --no-verify 绕过，CI 不能。
+# checkout 用 fetch-depth: 0，避免 shallow 仓库（SafeCode 对 shallow 是 Fail-Closed）。
+
 on:
   push:
-    branches: ["**"]
   pull_request:
-    branches: ["**"]
+
+permissions:
+  contents: read
 
 jobs:
   test:
-    name: pytest (${{ matrix.os }})
+    name: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.13"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.11"
-
-      - name: Install dependencies
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test dependency
         run: python -m pip install --upgrade pip pytest
-
-      - name: Ensure git available
-        run: git --version
-        shell: bash
-
-      - name: Run tests
+      - name: Run SafeCode test suite
         run: python -m pytest tests/ -v

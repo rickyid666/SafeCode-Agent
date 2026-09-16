@@ -1,0 +1,20 @@
+#!/bin/sh
+# SAFECODE_HOOK_VERSION: 1.0
+# SafeCode managed pre-push hook. Client-side gate only; not the sole boundary.
+# CI Required Checks + Branch Protection are independent defenses.
+HOOK_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$HOOK_DIR/.." && pwd)
+# 探测可用的 Python 解释器；找不到就阻断（fail-closed，绝不静默放行）
+if [ -n "$SAFECODE_PYTHON" ] && command -v "$SAFECODE_PYTHON" >/dev/null 2>&1; then
+  exec "$SAFECODE_PYTHON" "$REPO_ROOT/scripts/pre-push.py" "$@"
+fi
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    exec "$candidate" "$REPO_ROOT/scripts/pre-push.py" "$@"
+  fi
+done
+if command -v py >/dev/null 2>&1; then
+  exec py -3 "$REPO_ROOT/scripts/pre-push.py" "$@"
+fi
+echo "SafeCode: no python interpreter found, blocking push (fail-closed)" >&2
+exit 1

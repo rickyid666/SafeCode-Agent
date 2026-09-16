@@ -1,5 +1,17 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.safecode/
-pytest_out.txt
+*.egg-info/
+
+# SafeCode 运行时状态：预算、approvals、events、诊断报告
+# 注意：.safecode/baseline.json 例外——Baseline 必须进 Git 才能审计
+.safecode/*
+!.safecode/baseline.json
+
+# 本地调试输出
+*.out
+pytest_*.txt
+dep_out.txt
+scan_*.json
+scan_*.err
+.pytest_tmp/

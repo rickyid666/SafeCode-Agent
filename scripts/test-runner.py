@@ -1,212 +1,427 @@
-#!/usr/bin/env python3
-"""SafeCode Agent — 测试运行器与失败分类。
+"""SafeCode Test Runner：统一执行项目测试，并做可复现的 Flaky 检测。
 
-调用 `python -m pytest` 运行测试，解析其输出，将失败按错误等级分类：
+关键语义（对应 v7 契约）：
 
-    L0  全部通过                       -> 继续
-    L1  普通断言失败 (assert)          -> 自动修复
-    L2  编译 / 语法错误 (SyntaxError)  -> 定位并修复
-    L3  环境 / 依赖异常 (ImportError / ModuleNotFoundError / fixture 错误)
-                                     -> 尝试恢复依赖
-    L6  无法归类的失败                 -> 停止并请求人工确认
+- 失败分类：编译 / 语法 -> L2，断言 -> L1，依赖 / 收集 -> L3，pytest 自身异常 -> L3，
+  无法归类 -> L6。等级是 Policy Engine 的输入，不是给 Agent 的建议。
+- Flaky 检测：初始运行 FAIL 后，在代码与环境不变的前提下额外 rerun N 次
+  （默认取 .safecode.yml 的 testing.flaky_detection.reruns，缺省 3）。
+  结果不稳定（既有 PASS 又有 FAIL）-> category = FLAKY_TEST，
+  仍然 DENY（测试套件确实没通过，不能放行 Push），但明确提示"不要修改业务代码"。
+  每次运行结果都记录下来（run 序号、退出码、失败测试、HEAD sha、环境摘要）以便复现与审计。
+- 预算：初始运行计 test_runs，Flaky rerun 只计 test_runs（record_flaky_rerun），
+  两者都不计 recoveries。预算耗尽 -> BUDGET_EXHAUSTED + DENY。
+- 检查无法完成（pytest 不可用、超时）-> 不 PASS。
 
-用法：
-    python scripts/test-runner.py [--json] [pytest 目标路径...] [-- --透传参数]
-
-退出码：
-    0  全部通过（L0）
-    1  存在失败 / 测试被拒绝（L1/L2/L3/L6）
-    2  用法错误 / 内部错误
+纯 Python 标准库。Python >= 3.10。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import platform
 import re
 import subprocess
 import sys
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import safecode_common as sc
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DEFAULT_TIMEOUT = 1800  # 秒
+from safecode_common import (  # noqa: E402
+    CATEGORY_TEST,
+    EXIT_ENV,
+    EXIT_FINDING,
+    EXIT_OK,
+    EXIT_TOOL,
+    EXIT_USAGE,
+    L0,
+    L1,
+    L2,
+    L3,
+    L6,
+    Reporter,
+    add_common_arguments,
+    fail_deny_result,
+    make_result,
+    pass_result,
+    repo_head,
+    repo_root,
+    reporter_from_args,
+    resolve_mode,
+    tool_error_result,
+)
+from safecode_budget import (  # noqa: E402
+    BudgetError,
+    budget_report,
+    check_exhausted,
+    get_current_task,
+    load_state,
+    record_flaky_rerun,
+    record_success,
+    record_test_run,
+    set_current_task,
+)
+from safecode_config import ConfigError, load_config  # noqa: E402
 
-# pytest 失败项摘要行： "FAILED path::test - Reason" 或 "FAILED path::test"
-_FAILED_RE = re.compile(r"^FAILED\s+(\S+?)(?:\s+-\s+(.*))?$")
-# 错误（收集/import）项
-_ERROR_RE = re.compile(r"^(ERROR|INTERNALERROR)\s+(\S+)\s*(?:-\s+(.*))?$")
+CODE_TEST_PASSED = "TEST_PASSED"
+CODE_TEST_FAILED = "TEST_FAILED"
+CODE_FLAKY_TEST = "FLAKY_TEST"
+CODE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+CODE_PYTEST_UNAVAILABLE = "PYTEST_UNAVAILABLE"
+CODE_TEST_TIMEOUT = "TEST_TIMEOUT"
+
+DEFAULT_TIMEOUT = 1800
+MAX_OUTPUT_KEPT = 400_000
+
+# pytest 退出码含义
+PYTEST_OK = 0
+PYTEST_TESTS_FAILED = 1
+PYTEST_INTERRUPTED = 2
+PYTEST_INTERNAL_ERROR = 3
+PYTEST_USAGE_ERROR = 4
+PYTEST_NO_TESTS = 5
+
+_FAILED_LINE_RE = re.compile(r"^(?P<kind>FAILED|ERROR)\s+(?P<node>[^\s]+)(?:\s+-\s+(?P<msg>.*))?$")
+_TESTS_SUMMARY_RE = re.compile(r"^(?P<count>\d+)\s+failed")
+_PASSED_SUMMARY_RE = re.compile(r"^(?P<count>\d+)\s+passed")
 
 
-class FailureItem:
-    def __init__(self, node_id: str, message: str, sub_level: str):
-        self.node_id = node_id
-        self.message = (message or "").strip()
-        self.sub_level = sub_level
+class RunResult:
+    """一次 pytest 执行的结果。"""
+
+    def __init__(self, returncode: int, stdout: str, stderr: str,
+                 duration: float, timed_out: bool = False, error: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.duration = duration
+        self.timed_out = timed_out
+        self.error = error
 
     @property
-    def file(self) -> str:
-        # node id 形如 path/to/test.py::TestClass::test_name
-        return self.node_id.split("::", 1)[0] if self.node_id else ""
+    def passed(self) -> bool:
+        return self.returncode == PYTEST_OK and not self.timed_out and not self.error
 
-    @property
-    def line(self) -> int:
-        # pytest 短摘要不含行号，尝试从消息提取 "(line N)"
-        m = re.search(r"line\s+(\d+)", self.message)
-        if m:
-            return int(m.group(1))
-        return 0
+    def failed_tests(self) -> List[Dict[str, Any]]:
+        found: List[Dict[str, Any]] = []
+        seen = set()
+        for line in (self.stdout or "").splitlines():
+            match = _FAILED_LINE_RE.match(line.strip())
+            if not match:
+                continue
+            node = match.group("node")
+            if node in seen:
+                continue
+            seen.add(node)
+            path, _, test_name = node.partition("::")
+            entry: Dict[str, Any] = {
+                "node_id": node,
+                "file": path,
+                "test": test_name or "",
+            }
+            msg = (match.group("msg") or "").strip()
+            if msg:
+                entry["message"] = msg[:300]
+            found.append(entry)
+        return found
 
-    def summary(self) -> str:
-        return sc.truncate_evidence(self.message or self.node_id, 120)
+    def summary_line(self) -> str:
+        for line in reversed((self.stdout or "").splitlines()):
+            stripped = line.strip()
+            if "passed" in stripped or "failed" in stripped or "error" in stripped.lower():
+                return stripped[:200]
+        return ""
 
-
-def classify_message(message: str, node_id: str) -> str:
-    """根据失败消息与节点判定子等级。"""
-    msg = (message or "").lower()
-    if "syntaxerror" in msg or "invalid syntax" in msg:
-        return sc.L2
-    if "modulenotfounderror" in msg or "importerror" in msg or "no module named" in msg:
-        return sc.L3
-    if "fixture" in msg or "error during fixture" in msg or "fixture '" in msg or "not found" in msg:
-        return sc.L3
-    if "assert" in msg or "assertionerror" in msg:
-        return sc.L1
-    return sc.L6
-
-
-def parse_pytest_output(stdout: str, stderr: str) -> tuple:
-    """解析 pytest 输出，返回 (overall_level, [FailureItem], passed)."""
-    text = (stdout or "") + "\n" + (stderr or "")
-    items: list = []
-    collection_error = False
-
-    for line in text.splitlines():
-        fm = _FAILED_RE.match(line.strip())
-        if fm:
-            node_id = fm.group(1)
-            message = fm.group(2) or ""
-            level = classify_message(message, node_id)
-            items.append(FailureItem(node_id, message, level))
-            continue
-        em = _ERROR_RE.match(line.strip())
-        if em:
-            collection_error = True
-            node_id = em.group(2) or "collection"
-            message = em.group(3) or ""
-            # 收集错误多为 import / 语法问题
-            if "syntaxerror" in message.lower() or "invalid syntax" in message.lower():
-                level = sc.L2
-            else:
-                level = sc.L3
-            items.append(FailureItem(node_id, message, level))
-
-    # 通过判定
-    if not items:
-        if re.search(r"passed", text) or "no tests ran" in text.lower():
-            return sc.L0, [], True
-        return sc.L0, [], True
-
-    # 计算总等级：取最严重
-    sub_levels = {it.sub_level for it in items}
-    if sc.L2 in sub_levels:
-        overall = sc.L2
-    elif sc.L3 in sub_levels:
-        overall = sc.L3
-    elif sc.L1 in sub_levels:
-        overall = sc.L1
-    else:
-        overall = sc.L6
-    return overall, items, False
+    def to_dict(self, index: int) -> Dict[str, Any]:
+        return {
+            "run": index,
+            "exit_code": self.returncode,
+            "passed": self.passed,
+            "timed_out": self.timed_out,
+            "duration_seconds": round(self.duration, 2),
+            "summary": self.summary_line(),
+            "failed_tests": [t["node_id"] for t in self.failed_tests()],
+        }
 
 
-ACTION_HINT = {
-    sc.L1: "建议：自动修复失败的断言逻辑（检查预期值与实际值）。",
-    sc.L2: "建议：定位编译 / 语法错误并修复对应文件。",
-    sc.L3: "建议：尝试恢复环境 / 依赖（安装缺失包、检查虚拟环境、重建 fixture）。",
-    sc.L6: "建议：无法确定失败原因，停止修改并请求人工确认。",
-    sc.L0: "无需动作，全部通过。",
-}
+def classify_failure(result: RunResult) -> Tuple[str, str]:
+    """把失败归类为 L1 / L2 / L3 / L6，返回 (level, code)。"""
+    if result.timed_out:
+        return L3, CODE_TEST_TIMEOUT
+    text = f"{result.stdout}\n{result.stderr}"
+    lowered = text.lower()
+
+    if result.returncode == PYTEST_INTERNAL_ERROR:
+        return L3, "PYTEST_INTERNAL_ERROR"
+    if result.returncode == PYTEST_USAGE_ERROR:
+        return L3, "PYTEST_USAGE_ERROR"
+    if result.returncode == PYTEST_NO_TESTS:
+        return L3, "NO_TESTS_COLLECTED"
+    if "no module named pytest" in lowered or "pytest: not found" in lowered:
+        return L3, CODE_PYTEST_UNAVAILABLE
+
+    if re.search(r"(syntaxerror|indentationerror|taberror)", lowered):
+        return L2, "COMPILE_ERROR"
+    if re.search(r"(modulenotfounderror|importerror|cannot import name)", lowered):
+        return L3, "DEPENDENCY_ERROR"
+    if re.search(r"(error collecting|collection error|errors during collection)", lowered):
+        return L3, "COLLECTION_ERROR"
+    if re.search(r"(fixture .* not found|error in fixture)", lowered):
+        return L3, "FIXTURE_ERROR"
+    if re.search(r"(assertionerror|\bassert\b)", lowered):
+        return L1, "ASSERTION_FAILURE"
+    if result.returncode == PYTEST_TESTS_FAILED:
+        return L6, "UNKNOWN_FAILURE"
+    return L6, "UNKNOWN_FAILURE"
 
 
-def print_human_report(overall: str, items: list, duration: float, target: str) -> None:
-    print(sc.colorize("SafeCode 测试运行器", "bold"))
-    print(f"目标: {target}")
-    print(f"耗时: {duration:.1f}s")
-    print(f"错误等级: {overall} — {sc.error_level_meaning(overall)}")
-    print(f"失败/错误数: {len(items)}")
-    if items:
-        print("-" * 60)
-        for it in items:
-            print(f"  [{it.sub_level}] {it.file}"
-                  + (f":{it.line}" if it.line else "")
-                  + f"  ({sc.truncate_evidence(it.summary(), 80)})")
-    print("-" * 60)
-    print(ACTION_HINT.get(overall, ""))
+def environment_summary() -> Dict[str, Any]:
+    """环境摘要，用于让 Flaky 结果可复现。"""
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+    }
 
 
-def main(argv=None) -> int:
+def run_pytest(targets: Sequence[str], passthrough: Sequence[str], timeout: int,
+               cwd: str) -> RunResult:
+    """执行一次 pytest。"""
+    cmd = [sys.executable, "-m", "pytest", *targets, *passthrough]
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        return RunResult(EXIT_ENV, stdout[:MAX_OUTPUT_KEPT], stderr[:MAX_OUTPUT_KEPT],
+                         time.time() - started, timed_out=True,
+                         error=f"pytest timed out after {timeout}s")
+    except FileNotFoundError as exc:
+        return RunResult(EXIT_TOOL, "", str(exc), time.time() - started,
+                         error=f"cannot execute pytest: {exc}")
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    if "No module named pytest" in stderr or "No module named pytest" in stdout:
+        return RunResult(EXIT_TOOL, stdout[:MAX_OUTPUT_KEPT], stderr[:MAX_OUTPUT_KEPT],
+                         time.time() - started, error="pytest is not installed")
+    return RunResult(proc.returncode, stdout[:MAX_OUTPUT_KEPT], stderr[:MAX_OUTPUT_KEPT],
+                     time.time() - started)
+
+
+def resolve_task_id(explicit: Optional[str], root: Optional[str]) -> str:
+    task_id = explicit or os.environ.get("SAFECODE_TASK_ID") or ""
+    if not task_id:
+        try:
+            task_id = get_current_task(root) or ""
+        except Exception:
+            task_id = ""
+    if not task_id:
+        task_id = f"task-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            set_current_task(task_id, root)
+        except Exception:
+            pass
+    return task_id
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="test-runner.py",
-        description="SafeCode 测试运行器（pytest 封装 + 失败分级）",
+        description="Run project tests, classify failures, detect flaky tests.",
     )
-    parser.add_argument("--json", action="store_true", help="输出结构化 JSON 结果")
+    parser.add_argument("targets", nargs="*", default=[],
+                        help="pytest 目标路径（默认取配置 testing.targets）")
+    parser.add_argument("--no-flaky", action="store_true", help="关闭 Flaky 检测")
+    parser.add_argument("--reruns", type=int, default=None,
+                        help="Flaky 重跑次数（默认取配置，缺省 3）")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
-                        help=f"pytest 超时秒数（默认 {DEFAULT_TIMEOUT}）")
-    # 剩余位置参数分为 pytest 目标 与 -- 之后的透传参数
-    parser.add_argument("rest", nargs=argparse.REMAINDER, help="pytest 目标及 -- 透传参数")
-    args = parser.parse_args(argv)
+                        help="单次 pytest 超时秒数（默认 1800）")
+    parser.add_argument("--passthrough", default="",
+                        help="额外 pytest 参数，空格分隔")
+    add_common_arguments(parser)
+    return parser
 
-    # 拆分 targets 与 passthrough
-    rest = args.rest or []
-    if "--" in rest:
-        idx = rest.index("--")
-        targets = rest[:idx]
-        passthrough = rest[idx + 1:]
-    else:
-        targets = rest
-        passthrough = []
 
-    cmd = [sys.executable, "-m", "pytest", "-v"] + targets + passthrough
-    target_desc = " ".join(targets) if targets else "（默认目标）"
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
 
-    import time
-    start = time.perf_counter()
+    # 支持 `... -- -x -k foo` 形式的透传
+    passthrough_from_argv: List[str] = []
+    if "--" in raw:
+        idx = raw.index("--")
+        passthrough_from_argv = raw[idx + 1:]
+        raw = raw[:idx]
+
+    parser = build_parser()
+    args = parser.parse_args(raw)
+    reporter: Reporter = reporter_from_args(args)
+
+    cwd = os.getcwd()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
-    except subprocess.TimeoutExpired:
-        duration = time.perf_counter() - start
-        print(sc.colorize(f"pytest 超时（>{args.timeout}s），判定为环境异常 (L3)。", "red"),
-              file=sys.stderr)
-        if args.json:
-            sc.write_json_report({"tool": "test-runner", "level": sc.L3,
-                                  "passed": False, "failures": [],
-                                  "error": "timeout", "duration": round(duration, 1)})
-        return sc.EXIT_GATE_REJECT
-    except Exception as exc:  # noqa: BLE001
-        print(f"错误: 无法运行 pytest: {exc}", file=sys.stderr)
-        return sc.EXIT_USAGE
+        config = load_config(args.config, cwd)
+    except ConfigError as exc:
+        reporter.error(f"{exc.code}: {exc.message}")
+        result = make_result("FAIL", "DENY", exc.code, exc.message, category=CATEGORY_TEST)
+        return reporter.emit_result(result, exit_code=EXIT_USAGE)
 
-    duration = time.perf_counter() - start
-    overall, items, passed = parse_pytest_output(proc.stdout, proc.stderr)
+    root = repo_root(cwd) or cwd
+    mode = resolve_mode(strict_flag=bool(args.strict), config=config)
 
-    if args.json:
-        payload = {
-            "tool": "test-runner",
-            "level": overall,
-            "passed": passed,
-            "failure_count": len(items),
-            "action": ACTION_HINT.get(overall, ""),
-            "failures": [
-                {"level": it.sub_level, "file": it.file, "line": it.line,
-                 "summary": it.summary(), "node_id": it.node_id}
-                for it in items
-            ],
-            "pytest_returncode": proc.returncode,
-        }
-        sc.write_json_report(payload)
+    targets = list(args.targets)
+    if not targets:
+        configured = config.get("testing.targets") or []
+        targets = [str(t) for t in configured]
+    if not targets:
+        targets = ["tests"]
+
+    flaky_enabled = not args.no_flaky and bool(config.get("testing.flaky_detection.enabled", True))
+    reruns = args.reruns if args.reruns is not None else int(config.get("testing.flaky_detection.reruns", 3) or 0)
+    reruns = max(0, min(reruns, 10))
+
+    passthrough = list(passthrough_from_argv)
+    if args.passthrough:
+        passthrough.extend(args.passthrough.split())
+    passthrough.extend(["-q"] if "-q" not in passthrough else [])
+
+    task_id = resolve_task_id(args.task_id, root)
+    limits = config.budget_limits
+
+    reporter.info(f"SafeCode test run: targets={targets} task_id={task_id} mode={mode}")
+
+    # 首次运行
+    first = run_pytest(targets, passthrough, args.timeout, cwd)
+    runs: List[RunResult] = [first]
+
+    if first.passed:
+        try:
+            record_success(task_id, root=root, code=CODE_TEST_PASSED,
+                           summary="all tests passed", duration_seconds=first.duration)
+        except BudgetError as exc:
+            reporter.warn(f"budget update failed: {exc}")
+        result = pass_result(CODE_TEST_PASSED, "all tests passed",
+                             category=CATEGORY_TEST,
+                             metadata={
+                                 "level": L0,
+                                 "task_id": task_id,
+                                 "mode": mode,
+                                 "targets": targets,
+                                 "exit_code": first.returncode,
+                                 "duration_seconds": round(first.duration, 2),
+                                 "runs": [r.to_dict(i + 1) for i, r in enumerate(runs)],
+                             })
+        reporter.info("tests passed")
+        return reporter.emit_result(result, exit_code=EXIT_OK)
+
+    if first.timed_out:
+        result = tool_error_result(CODE_TEST_TIMEOUT,
+                                   first.error or "pytest timed out",
+                                   category=CATEGORY_TEST)
+        result.metadata.update({"task_id": task_id, "mode": mode, "targets": targets})
+        return reporter.emit_result(result, exit_code=EXIT_ENV)
+
+    if first.error and first.returncode == EXIT_TOOL:
+        result = tool_error_result(CODE_PYTEST_UNAVAILABLE, first.error,
+                                   category=CATEGORY_TEST)
+        result.metadata.update({"task_id": task_id, "mode": mode, "targets": targets})
+        return reporter.emit_result(result, exit_code=EXIT_TOOL)
+
+    level, code = classify_failure(first)
+    budget_state = None
+    budget_exhausted_reason: Optional[str] = None
+    try:
+        budget_state = record_test_run(task_id, root=root, level=level, code=code,
+                                       summary=first.summary_line(),
+                                       duration_seconds=first.duration)
+        budget_exhausted_reason = check_exhausted(budget_state, limits)
+    except BudgetError as exc:
+        reporter.error(f"budget update failed: {exc}")
+        budget_state = None
+        budget_exhausted_reason = f"budget state error: {exc}"
+
+    # Flaky 检测
+    flaky_records: List[Dict[str, Any]] = []
+    category = "DETERMINISTIC_FAILURE"
+    if flaky_enabled and reruns > 0 and not budget_exhausted_reason:
+        for i in range(reruns):
+            rerun = run_pytest(targets, passthrough, args.timeout, cwd)
+            runs.append(rerun)
+            flaky_records.append(rerun.to_dict(len(runs)))
+            try:
+                budget_state = record_flaky_rerun(
+                    task_id, root=root, level=level, code=code,
+                    summary=f"flaky rerun {i + 1}: {'PASS' if rerun.passed else 'FAIL'}",
+                    duration_seconds=rerun.duration)
+                budget_exhausted_reason = check_exhausted(budget_state, limits)
+            except BudgetError as exc:
+                reporter.warn(f"budget update failed on rerun: {exc}")
+            if budget_exhausted_reason:
+                reporter.warn(f"budget exhausted during flaky reruns: {budget_exhausted_reason}")
+                break
+        outcomes = {r.passed for r in runs}
+        if len(outcomes) > 1:
+            category = CODE_FLAKY_TEST
+
+    failed_tests = first.failed_tests()
+    locations = [{"file": t["file"], "line": 1} for t in failed_tests if t.get("file")]
+
+    metadata: Dict[str, Any] = {
+        "level": level,
+        "category": category,
+        "task_id": task_id,
+        "mode": mode,
+        "targets": targets,
+        "exit_code": first.returncode,
+        "duration_seconds": round(first.duration, 2),
+        "failed_tests": failed_tests,
+        "runs": [r.to_dict(i + 1) for i, r in enumerate(runs)],
+        "flaky_detection": {
+            "enabled": flaky_enabled,
+            "reruns_configured": reruns,
+            "reruns_performed": len(flaky_records),
+            "records": flaky_records,
+        },
+        "environment": environment_summary(),
+        "code_state": repo_head(root) or "",
+        "pytest_summary": first.summary_line(),
+    }
+    if budget_state is not None:
+        metadata["budget"] = budget_report(budget_state, limits)
+
+    if budget_exhausted_reason:
+        result = fail_deny_result(
+            CODE_BUDGET_EXHAUSTED,
+            f"recovery/test budget exhausted: {budget_exhausted_reason}. "
+            "Stop auto-recovery, do not push, human intervention required.",
+            category=CATEGORY_TEST, locations=locations, metadata=metadata)
+        reporter.error(result.message)
+        return reporter.emit_result(result, exit_code=EXIT_FINDING)
+
+    if category == CODE_FLAKY_TEST:
+        message = (
+            f"flaky test detected ({sum(1 for r in runs if r.passed)} pass / "
+            f"{sum(1 for r in runs if not r.passed)} fail over {len(runs)} runs): "
+            "do NOT modify business code, fix the test or its environment instead"
+        )
     else:
-        print_human_report(overall, items, duration, target_desc)
+        message = f"tests failed ({level} / {code}); push is blocked"
 
-    return sc.EXIT_PASS if passed else sc.EXIT_GATE_REJECT
+    result = fail_deny_result(code if category != CODE_FLAKY_TEST else CODE_FLAKY_TEST,
+                              message, category=CATEGORY_TEST,
+                              locations=locations, metadata=metadata)
+    reporter.error(message)
+    return reporter.emit_result(result, exit_code=EXIT_FINDING)
 
 
 if __name__ == "__main__":
