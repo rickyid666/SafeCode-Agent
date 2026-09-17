@@ -192,20 +192,18 @@ def _elapsed_seconds(state: Dict[str, Any]) -> int:
 # --------------------------------------------------------------------------- #
 
 def _open_lock_file(lock_path: str):
-    try:
-        fh = open(lock_path, "r+b")
-    except FileNotFoundError:
-        fh = open(lock_path, "w+b")
-    # 确保至少有 1 字节，便于基于区域的锁定（Windows）
-    try:
-        fh.seek(0, os.SEEK_END)
-        if fh.tell() == 0:
-            fh.write(b"\x00")
-        fh.flush()
-    except OSError:
-        pass
-    fh.seek(0)
-    return fh
+    """打开（必要时创建）锁文件：无缓冲、不写内容、不在持锁前 seek。
+
+    Windows 上 CRT 的字节区间锁是**强制锁**：别的进程正持着这把锁时，对同一文件
+    做带缓冲的 seek/write 会触发 flush 并落到被锁住的字节上，直接抛
+    PermissionError。所以这里只 open，不写也不 seek；所有可能失败的定位动作都放到
+    _acquire_lock 的重试循环里。
+
+    锁的范围是文件头 1 字节；文件为空时也允许锁（Windows 允许锁超出 EOF 的区域，
+    POSIX 的 flock 根本不看字节范围），因此不需要预先写一个字节进去。
+    """
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    return os.fdopen(fd, "r+b", buffering=0)
 
 
 def _acquire_lock(fh, timeout: float) -> None:
@@ -213,10 +211,12 @@ def _acquire_lock(fh, timeout: float) -> None:
     while True:
         try:
             if os.name == "nt":
-                fh.seek(0)
+                # 纯定位（无缓冲，不会写盘）；对方持锁时这里可能抛 PermissionError，
+                # 由下面的 except 转成重试，而不是把进程打挂。
+                os.lseek(fh.fileno(), 0, os.SEEK_SET)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         except OSError:
             if time.monotonic() >= deadline:
@@ -224,7 +224,19 @@ def _acquire_lock(fh, timeout: float) -> None:
                     CODE_LOCK_TIMEOUT,
                     f"could not acquire budget lock within {timeout}s: {fh.name}",
                 )
-            time.sleep(0.01)
+            time.sleep(0.005)
+
+
+def _release_lock(fh) -> None:
+    """显式释放锁；失败也不能掩盖业务异常，交给 close 兜底。"""
+    try:
+        if os.name == "nt":
+            os.lseek(fh.fileno(), 0, os.SEEK_SET)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 def _with_lock(root: Optional[str], task_id: str, mutator, *, timeout: float = LOCK_TIMEOUT) -> Dict[str, Any]:
@@ -250,6 +262,7 @@ def _with_lock(root: Optional[str], task_id: str, mutator, *, timeout: float = L
         data["elapsed_seconds"] = _elapsed_seconds(data)
         write_json_file(path, data)
     finally:
+        _release_lock(lock_fh)
         try:
             lock_fh.close()
         except OSError:
