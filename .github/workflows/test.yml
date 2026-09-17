@@ -2,6 +2,11 @@ name: Tests
 
 # 第二道防线：本地 hook 可以被删除、可以用 --no-verify 绕过，CI 不能。
 # checkout 用 fetch-depth: 0，避免 shallow 仓库（SafeCode 对 shallow 是 Fail-Closed）。
+#
+# 结构说明：真正跑测试的是矩阵 job `tests`，最后有一个聚合 job `test`。
+# Branch Protection 里只勾 `test` 与 `security` 这两个稳定名字——直接勾矩阵展开出的
+# "test (ubuntu-latest, 3.11)" 之类，以后一改矩阵就会留下永远等不到的状态检查，
+# 把合并永久卡死。
 
 on:
   push:
@@ -11,8 +16,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test
+  tests:
+    name: tests (${{ matrix.os }}, ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -37,3 +42,19 @@ jobs:
         run: python -m pip install --upgrade pip pytest
       - name: Run SafeCode test suite
         run: python -m pytest tests/ -v
+
+  # 聚合门：矩阵里任何一条腿失败它就失败；名字固定为 test，作为 Required check。
+  test:
+    name: test
+    needs: tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        run: |
+          echo "tests matrix result: ${{ needs.tests.result }}"
+          if [ "${{ needs.tests.result }}" != "success" ]; then
+            echo "::error::test matrix did not pass (${{ needs.tests.result }})"
+            exit 1
+          fi
+          echo "all matrix legs passed"

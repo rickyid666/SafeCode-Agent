@@ -211,9 +211,27 @@ security      .github/workflows/security.yml Secret 扫描（本地 + 外部 Sca
 dependency    .github/workflows/security.yml 依赖供应链
 ```
 
-`security.yml` 里两个 job 分别是 `security` 与 `dependency`，`test.yml` 里是 `test`。
-注意 job 名（`name:` 字段）才是 Required check 里要填的值，光有 workflow 文件不等于
-它是 Required check。建议同时关掉 "Allow force pushes" 与 "Allow deletions"。
+`security.yml` 里两个 job 分别是 `security` 与 `dependency`；`test.yml` 里跑测试的是矩阵
+job `tests`，另有一个聚合 job 名字固定叫 `test`。Required check 要填的是 job 的
+`name`，而矩阵展开出来的名字是 `test (ubuntu-latest, 3.11)` 这种——**不要**直接勾它们，
+改一次矩阵就会留下永远等不到的状态检查，把合并永久卡死。所以这里用聚合门：
+
+```
+tiers:  tests (matrix)  ->  test (aggregate)   <- Branch Protection 勾这个
+```
+
+准确边界：Required status checks 拦的是**合并 PR**，不是直推。直推 main 要靠
+"Require a pull request before merging" 或推送白名单才会被服务端拒绝；本仓库没开 PR
+要求，所以直推仍然可用——本地 hook 是那道闸。
+
+当前配置（2026-09-17 通过 API 写入，`enforce_admins: true`）：
+
+```
+required_status_checks: [test, security]   strict: true
+allow_force_pushes: false
+allow_deletions: false
+required_pull_request_reviews: null        restrictions: null
+```
 
 ## Rule → Detection → Gate → Test
 
