@@ -78,8 +78,13 @@ SAFECODE_APPROVAL_TOKEN=/tmp/safecode-token.json git push
 ```
 
 token 绑定 `operation + 仓库身份 + HEAD / 工作区状态 + 目标分支`：换个分支、换个提交、
-改一个参数，指纹就变了，必须重新授权。想彻底放开某个分支，就把它从
-`.safecode.yml` 的 `protected_branches` 里去掉——没有"绕过一次"的裸开关。
+改一个参数，指纹就变了，必须重新授权。
+
+TTL 要留够余量：token 在门禁流水线的最后一步（Git Guard）才被核销，而它前面还有测试。
+测试跑 9 分钟的项目用默认 10 分钟就是卡边界，给 `--ttl 30` 更稳。
+
+想彻底放开某个分支，就把它从 `.safecode.yml` 的 `protected_branches` 里去掉——
+没有"绕过一次"的裸开关。
 
 ## CLI 契约
 
