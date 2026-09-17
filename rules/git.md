@@ -119,13 +119,25 @@ push 到受保护分支
 操作字符串；`metadata.operation_fingerprint` 绑定仓库身份、HEAD、目标分支与相关 diff。
 换个分支、换个提交，指纹就变了，必须重新授权。
 
-两个实操注意点：
+三个实操注意点：
 
 - **签发与核销之间不要动工作区。** 指纹包含工作区是否脏，你在等待门禁跑完时改一个
   文件，token 就失效了（表现是回到 REQUIRE_APPROVAL，而不是报 token 无效——因为
   "指纹不匹配"按"该 token 不能授权本操作"处理）。
 - **TTL 要大于门禁总耗时。** token 在流水线最后一步才被核销，前面还有测试；测试跑
   9 分钟的项目，默认 10 分钟就是卡边界，用 `--ttl 30`。
+- **服务端还有一道 checks 的门，token 通过不等于推送成功。** Branch Protection 里配了
+  Required status checks 之后，服务端要求被推的 commit 本身已经拿到这些 check 的
+  success，否则回 `GH006: Protected branch update failed ... required status checks are
+  expected`。所以直推 main 的完整流程是两段：
+
+  ```bash
+  git push origin HEAD:refs/heads/ci/<topic>   # 先让这个 sha 在 CI 上跑出 test/security
+  git push origin main                         # checks 满足后再推，本地 gate + token 照走
+  ```
+
+  实测证据：本地门禁全绿、token 指纹匹配、git-guard 返回 ALLOW 的那次推送，仍被服务端
+  以 GH006 拒掉；把同一 sha 推到 `ci/<topic>` 等 CI 绿了再推 main 就通过了。
 
 这里没有"裸环境变量开关"。一个 `SAFECODE_ALLOW_MAIN=1` 之类的开关等于永久解锁，
 和"授权必须绑定具体操作"直接冲突，所以不存在。要让某个分支彻底不受这条限制，

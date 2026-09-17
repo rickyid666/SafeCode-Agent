@@ -220,9 +220,25 @@ job `tests`，另有一个聚合 job 名字固定叫 `test`。Required check 要
 tiers:  tests (matrix)  ->  test (aggregate)   <- Branch Protection 勾这个
 ```
 
-准确边界：Required status checks 拦的是**合并 PR**，不是直推。直推 main 要靠
-"Require a pull request before merging" 或推送白名单才会被服务端拒绝；本仓库没开 PR
-要求，所以直推仍然可用——本地 hook 是那道闸。
+准确边界（2026-09-17 实测更正）：Required status checks **会**拦直推，不只是合并 PR。
+配好 required checks 之后，直推一个还没取得这些 check 成功的 commit 会被服务端拒掉：
+
+```
+remote: error: GH006: Protected branch update failed for refs/heads/main.
+remote: - 2 of 2 required status checks are expected.
+```
+
+所以要直推 main，被推的那个 commit 必须**先**已经拿到 `test` 与 `security` 的
+success。实测可行的做法是先把它推到非保护分支跑一轮 CI，checks 满足后再推 main：
+
+```bash
+git push origin HEAD:refs/heads/ci/<topic>   # CI 在这个 sha 上跑出 test/security
+git push origin main                         # checks 已满足，服务端放行
+```
+
+（走 PR 合并同样可以。）注意这是叠加关系而不是二选一：本地 hook 与授权 token 照旧
+要过，服务端再多一道 checks 的门。想恢复"一步直推"，只能把 `test`/`security` 从
+required checks 里去掉，或者在 ruleset 里给 admin 配 bypass——两者都会削弱这条防线。
 
 当前配置（2026-09-17 通过 API 写入，`enforce_admins: true`）：
 
@@ -340,6 +356,8 @@ python -m pytest tests/ -v
    （`PROTECTED_BRANCH_APPROVAL_REQUIRED` + operation fingerprint），人工复核后签发
    一次性 token 即可放行。没有 `SAFECODE_ALLOW_MAIN=1` 这类裸开关——那等于永久解锁，
    和"授权必须绑定具体操作"冲突。想彻底放开某个分支就从 `protected_branches` 去掉。
+   注意这只解决**本地**那一层：服务端 Required status checks 另有一道，要求该 commit
+   先取得 check 成功（见上文"分支保护怎么配"）。
 3. **测试文件不再自动降级。** 上一版把测试/示例文件里的疑似凭据降级为 info 放过。
    那等于给"把真凭据写进测试文件"留了后门。现在只有占位符形态的值不算 finding，
    其余一律按真实 finding 处理，需要例外就写 `allow_list`（带 reason）或 Baseline。

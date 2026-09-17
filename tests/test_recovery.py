@@ -169,29 +169,74 @@ def test_corrupt_state_exit4(tmp_git_repo: Path):
 # 8. 并发递增不丢更新（两个进程同时 record-failure，最终计数 == 2）
 # --------------------------------------------------------------------------- #
 
-def test_concurrent_increment_no_lost_update(tmp_git_repo: Path):
+def _concurrent_record(repo: Path, task: str, count: int):
+    """同时启动 count 个 record-failure 进程，返回 (returncode, stdout, stderr) 列表。"""
     env = child_env({})
-    procs = []
-    for _ in range(2):
-        p = subprocess.Popen(
-            [PYTHON, str(SCRIPTS_DIR / "recovery.py"), "record-failure", "--task-id", TASK],
-            cwd=str(tmp_git_repo),
+    procs = [
+        subprocess.Popen(
+            [PYTHON, str(SCRIPTS_DIR / "recovery.py"), "record-failure", "--task-id", task],
+            cwd=str(repo),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        procs.append(p)
+        for _ in range(count)
+    ]
+    results = []
     for p in procs:
-        p.wait(timeout=60)
+        out, err = p.communicate(timeout=120)
+        results.append((p.returncode, out, err))
+    return results
 
-    state_file = tmp_git_repo / ".safecode" / "state" / f"{TASK}.json"
+
+def _assert_no_child_crash(results):
+    """并发下不许出现未捕获异常。
+
+    修复前的表现正是进程崩溃（stderr 有 Traceback、stdout 空），而不是返回一个
+    "写入失败"的结构化结果——所以这条断言比只看计数更早暴露问题。
+    """
+    for code, out, err in results:
+        assert "Traceback" not in err, f"child crashed (exit {code}):\n{err[-800:]}"
+
+
+def test_concurrent_increment_no_lost_update(tmp_git_repo: Path):
+    """并发写状态文件不得丢更新。
+
+    回归背景：Windows 上锁文件用 msvcrt 字节区间锁（强制锁），持锁进程对锁文件做带
+    缓冲的 seek 会抛 PermissionError；该异常原来在 try 之外，进程直接崩掉、整次计数
+    消失。CI 实测 recoveries=1 而不是 2（assert 1 == 2）。单轮 2 进程的暴露率只有约
+    一半，所以这里跑多轮，让回归必须稳定通过。
+    """
+    for i in range(5):
+        task = f"{TASK}-c{i}"
+        results = _concurrent_record(tmp_git_repo, task, 2)
+        _assert_no_child_crash(results)
+
+        state_file = tmp_git_repo / ".safecode" / "state" / f"{task}.json"
+        assert state_file.exists(), "state file must exist after concurrent runs"
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        # 默认 --type recovery → recoveries +1，consecutive_failures +1（不消耗 test_runs）
+        assert data["recoveries"] == 2, (i, data)
+        assert data["consecutive_failures"] == 2, (i, data)
+        assert data["test_runs"] == 0, (i, data)
+
+
+def test_concurrent_increment_high_contention(tmp_git_repo: Path):
+    """8 个进程抢同一把锁，计数必须精确等于进程数。
+
+    达到 Recovery 上限后退出码是 1（BUDGET_EXHAUSTED），但这一次的计数仍然要落盘——
+    所以这里只断言计数与"没有未捕获异常"，不假设退出码。
+    """
+    task = f"{TASK}-heavy"
+    results = _concurrent_record(tmp_git_repo, task, 8)
+    _assert_no_child_crash(results)
+
+    state_file = tmp_git_repo / ".safecode" / "state" / f"{task}.json"
     assert state_file.exists(), "state file must exist after concurrent runs"
     data = json.loads(state_file.read_text(encoding="utf-8"))
-    # 默认 --type recovery → recoveries +1，consecutive_failures +1（不消耗 test_runs）
-    assert data["recoveries"] == 2, data
-    assert data["consecutive_failures"] == 2, data
-    assert data["test_runs"] == 0, data
+    assert data["recoveries"] == 8, data
+    assert data["consecutive_failures"] == 8, data
 
 
 # --------------------------------------------------------------------------- #
