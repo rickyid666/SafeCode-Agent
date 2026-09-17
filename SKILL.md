@@ -10,12 +10,12 @@ description: 面向 AI Coding Agent 的安全开发工作流：检查 -> 修改 
 一句最重要的话：**不要相信"AI 说自己检查过了"。** 关键安全规则由 `scripts/` 下的
 可执行门禁强制执行，你要做的是调用它们、读取它们的退出码，并且尊重结果。
 
-依赖规则细节时读 `../rules/`：
+依赖规则细节时读 `rules/`：
 
-- `../rules/security.md` — 安全扫描、Baseline、凭据泄露处理
-- `../rules/testing.md` — 测试优先级、Flaky 检测
-- `../rules/recovery.md` — 错误等级、自救预算
-- `../rules/git.md` — Git 门禁、Hard Stop、授权令牌
+- `rules/security.md` — 安全扫描、Baseline、凭据泄露处理
+- `rules/testing.md` — 测试优先级、Flaky 检测
+- `rules/recovery.md` — 错误等级、自救预算
+- `rules/git.md` — Git 门禁、Hard Stop、授权令牌
 
 ## 工作流
 

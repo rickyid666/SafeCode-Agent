@@ -64,6 +64,10 @@ import safecode_approval as sa
 
 ZERO_SHA = "0" * 40
 
+# git 传给 pre-push hook 的 sha 一定是 40 位（SHA-1）或 64 位（SHA-256）十六进制。
+# 用它校验输入形状：不符合这个形状的行就不是 git 给的 hook 输入。
+_SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+
 # 默认受保护分支（配置优先）
 DEFAULT_PROTECTED_BRANCHES = ("main", "master")
 
@@ -393,6 +397,7 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
     soft_meta = []
     approval_refs = set()   # 需要授权的 remote ref，用于拼出可复现的 operation 字符串
     delete_refs = []        # 需要授权的删除操作：(remote_ref, expected_old_sha)
+    malformed_lines = []    # 看起来不是 git hook 输入的行（不是 40/64 位 sha）
 
     for raw_line in stdin_text.splitlines():
         line = raw_line.strip()
@@ -400,8 +405,16 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
             continue
         parts = line.split()
         if len(parts) < 4:
+            malformed_lines.append(line)
             continue
         local_ref, local_sha, remote_ref, remote_sha = parts[0], parts[1], parts[2], parts[3]
+
+        # 只接受 git 真正会传的形状。早先的实现不校验格式，于是任何 4 段以上的文本都会
+        # 被当成 ref 行；非法 sha 会让 merge-base 失败，又被解读成"强推"，把一段无关输入
+        # 变成一次拒绝（实测：hook 从被污染的 stdin 里读到垃圾，流水线误报阻断）。
+        if not (_SHA_RE.match(local_sha) and _SHA_RE.match(remote_sha)):
+            malformed_lines.append(line)
+            continue
 
         # 先解析远程分支名：删除判定和受保护分支判定都要用它
         if "refs/heads/" in remote_ref:
@@ -487,7 +500,8 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
             "; ".join(hard_meta),
             severity=sc.SEVERITY_HIGH,
             category=sc.CATEGORY_GIT,
-            metadata={"reasons": hard_meta, "fingerprint_required": False},
+            metadata={"reasons": hard_meta, "fingerprint_required": False,
+                      "malformed_hook_lines": malformed_lines[:10]},
         )
         return _emit(reporter, result)
 
@@ -541,6 +555,7 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
             target=target,
         )
         req["metadata"]["reasons"] = soft_meta
+        req["metadata"]["malformed_hook_lines"] = malformed_lines[:10]
         req["message"] = "; ".join(soft_meta)
         result = sc.Result.from_dict(req)
         return _emit(reporter, result)
@@ -548,6 +563,7 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
     result = sc.pass_result(
         "PRE_PUSH_OK", "pre-push checks passed",
         category=sc.CATEGORY_GIT,
+        metadata={"malformed_hook_lines": malformed_lines[:10]},
     )
     return _emit(reporter, result)
 

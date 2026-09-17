@@ -33,20 +33,38 @@ Agent 修改
 
 ## 快速开始
 
-作为 Skill 安装：
+三种用法，按需要选。
+
+**1) 作为 Skill 安装**（让 Agent 按这套流程工作）。仓库根就是 skill 根，克隆到 skill 目录即可：
 
 ```bash
-git clone https://github.com/rickyid666/SafeCode-Agent
-# 把 skill/SKILL.md 与 rules/ 挂到你使用的 Agent 的 skill 目录
-# 脚本按需直接调用，无需安装：
-python scripts/security-scan.py --all
+# WorkBuddy 用户级：所有项目可用
+git clone https://github.com/rickyid666/SafeCode-Agent ~/.workbuddy/skills/safecode-agent
+
+# 或项目级：只在该项目生效
+git clone https://github.com/rickyid666/SafeCode-Agent .workbuddy/skills/safecode-agent
 ```
 
-接通本地门禁（Push 时真正会被拦）：
+**2) 装进某个项目当门禁**（纯脚本，不依赖任何 Agent）：
+
+```bash
+cd /path/to/your-project
+cp -r /path/to/SafeCode-Agent/scripts /path/to/SafeCode-Agent/schemas .
+cp /path/to/SafeCode-Agent/.safecode.yml .       # 按项目改：project.name、protected_branches 等
+python scripts/safecode.py pre-push              # 先手动跑一遍看结果
+```
+
+**3) 接通本地 hook**（之后每次 `git push` 自动跑门禁）：
 
 ```bash
 python scripts/hook-manager.py install
 python scripts/hook-manager.py verify
+```
+
+脚本也都能单独调用，无需安装：
+
+```bash
+python scripts/security-scan.py --all
 ```
 
 日常使用：
@@ -344,8 +362,9 @@ SafeCode 要求"例外必须显式、可审计"，它对自己也执行这一条
 ```
 SafeCode-Agent/
 ├── .safecode.yml            本项目自身的配置（self-hosting）
+├── SKILL.md                 Agent 工作协议（仓库根就是 skill 根）
+├── AGENTS.md                给在本仓库工作的 Agent 的守则
 ├── schemas/                 result-1.0.json / config-1.0.json
-├── skill/SKILL.md           Agent 工作协议
 ├── rules/                   security / testing / recovery / git
 ├── scripts/
 │   ├── safecode.py          统一 CLI 入口（路由）

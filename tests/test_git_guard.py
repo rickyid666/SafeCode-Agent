@@ -139,6 +139,26 @@ def test_pre_push_force_detected(tmp_git_repo):
     assert payload["code"] == "FORCE_PUSH"
 
 
+def test_pre_push_ignores_malformed_hook_input(tmp_git_repo):
+    """stdin 里不是 git hook 形状的内容不能被当成 ref 行。
+
+    回归：早先的实现只判断"至少有 4 段"，于是任何这类文本都会被解析成
+    `local_ref local_sha remote_ref remote_sha`；非法 sha 让 merge-base 失败，
+    又被解读成"强推"，把一段无关输入变成一次拒绝。
+    """
+    repo = tmp_git_repo
+    junk = "not a ref line at all\nanother junk line here\n"
+
+    proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=junk)
+    assert proc.returncode == 0, proc.stderr
+    payload = parse_json_output(proc)
+    assert_result_schema(payload)
+    assert payload["decision"] == "ALLOW", payload
+    assert payload["code"] == "PRE_PUSH_OK", payload
+    # 被跳过的行要留痕，方便审计"这次输入里到底有什么"
+    assert len(payload["metadata"]["malformed_hook_lines"]) == 2
+
+
 def test_pre_push_normal_branch_deletion_requires_approval(tmp_git_repo):
     """删普通分支是常规操作（合并后清理）-> REQUIRE_APPROVAL，并绑定 expected old sha。"""
     repo = tmp_git_repo
@@ -525,10 +545,18 @@ def test_hook_survives_git_positional_args(tmp_git_repo):
 
     env = {"SAFECODE_PYTHON": sys.executable,
            "SAFECODE_PREPUSH_ARGS": "--dry-run --skip-tests"}
+    # 显式给空 stdin。hook 会把 stdin 当作 git 传来的 ref 行，若让子进程继承宿主的
+    # fd 0，测试结果就取决于宿主 stdin 里恰好有什么——实测在全量跑时被污染成阻断。
     proc = run_cmd([sh, str(hook), "origin", "https://example.invalid/repo.git"],
-                   cwd=repo, env=env)
+                   cwd=repo, env=env, stdin_text="")
     assert "unrecognized arguments" not in proc.stderr, proc.stderr
     assert proc.returncode == 0, proc.stderr
     payload = parse_json_output(proc)
     assert_result_schema(payload)
-    assert payload["code"] == "PIPELINE_PASSED"
+    assert payload["code"] == "PIPELINE_PASSED", json.dumps(
+        {"code": payload["code"], "message": payload.get("message"),
+         "steps": [(s["step"], s["status"], s["decision"], s["code"], s.get("message"))
+                   for s in payload["metadata"]["steps"]],
+         "blocking": payload["metadata"].get("blocking_steps"),
+         "stderr_tail": proc.stderr[-800:]},
+        ensure_ascii=False, indent=1)
