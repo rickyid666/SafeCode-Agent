@@ -63,6 +63,24 @@ python scripts/safecode.py recover status             # 自救预算
 
 所有脚本都可以独立执行（CI 里通常直接调单个脚本），也都支持统一入口。
 
+推到受保护分支（默认 `main` / `master`）时会被要求人工授权，走一次性 token：
+
+```bash
+# 1. 先推一次，会被拦下：stderr 上给出 REQUIRED_APPROVAL 与 operation
+git push
+
+# 2. 人工复核后签发一次性 token（默认 10 分钟有效，只能核销一次）
+python scripts/safecode_approval.py issue --operation "git push refs/heads/main" \
+    --approved-by human --ttl 10 > /tmp/safecode-token.json
+
+# 3. 带 token 重跑同一个 push
+SAFECODE_APPROVAL_TOKEN=/tmp/safecode-token.json git push
+```
+
+token 绑定 `operation + 仓库身份 + HEAD / 工作区状态 + 目标分支`：换个分支、换个提交、
+改一个参数，指纹就变了，必须重新授权。想彻底放开某个分支，就把它从
+`.safecode.yml` 的 `protected_branches` 里去掉——没有"绕过一次"的裸开关。
+
 ## CLI 契约
 
 ```
@@ -295,17 +313,21 @@ python -m pytest tests/ -v
    `exit 1`（阻断通道，Git 必须拦下来），JSON 里保留 `decision=REQUIRE_APPROVAL`，
    Resolver 对 `status=PASS + decision=REQUIRE_APPROVAL` 保留授权语义，不做降级。
    也就是说：**它一定是阻断的，但不是不可挽救的阻断。**
-2. **测试文件不再自动降级。** 上一版把测试/示例文件里的疑似凭据降级为 info 放过。
+2. **受保护分支直推是可授权的，不是硬拒绝。** 直推 `main` 会拿到结构化授权请求
+   （`PROTECTED_BRANCH_APPROVAL_REQUIRED` + operation fingerprint），人工复核后签发
+   一次性 token 即可放行。没有 `SAFECODE_ALLOW_MAIN=1` 这类裸开关——那等于永久解锁，
+   和"授权必须绑定具体操作"冲突。想彻底放开某个分支就从 `protected_branches` 去掉。
+3. **测试文件不再自动降级。** 上一版把测试/示例文件里的疑似凭据降级为 info 放过。
    那等于给"把真凭据写进测试文件"留了后门。现在只有占位符形态的值不算 finding，
    其余一律按真实 finding 处理，需要例外就写 `allow_list`（带 reason）或 Baseline。
-3. **求救预算耗尽用 `exit 1`。** 新契约的退出码只有 0-4，没有给预算耗尽留位置。
+4. **自救预算耗尽用 `exit 1`。** 新契约的退出码只有 0-4，没有给预算耗尽留位置。
    预算耗尽属于"策略问题"，因此 `exit 1 + code=BUDGET_EXHAUSTED + decision=DENY`，
    靠 JSON 的 `code` 与"发现 Secret"区分。
-4. **`dependencies:` 配置段是扩展。** 契约的 v1.0 配置模型没有为 Dependency Guard
+5. **`dependencies:` 配置段是扩展。** 契约的 v1.0 配置模型没有为 Dependency Guard
    定义配置，这里加了 `dependencies:`（`require_lockfile` / `forbidden_packages` /
    `allowed_registries` / `external_scanner`）。校验器允许未知顶层键，所以这不破坏
    v1.0 兼容性。
-5. **没有 manifest 时依赖检查返回 PASS。** 仓库里没有任何依赖清单（没有
+6. **没有 manifest 时依赖检查返回 PASS。** 仓库里没有任何依赖清单（没有
    package.json / pyproject.toml / go.mod / Cargo.toml）时，供应链没有检查对象，
    这是一次空检查而不是"跳过了检查"。有 manifest 但 Scanner 缺失时依旧按
    Fail-Closed 处理。

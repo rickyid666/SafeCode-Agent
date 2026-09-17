@@ -74,7 +74,7 @@ def child_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env["PYTHONPATH"] = os.pathsep.join(pythonpath)
     if GIT_BIN_DIR:
         env["PATH"] = GIT_BIN_DIR + os.pathsep + env.get("PATH", "")
-    for key in ("SAFECODE_STRICT", "SAFECODE_ALLOW_MAIN", "SAFECODE_APPROVAL_TOKEN",
+    for key in ("SAFECODE_STRICT", "SAFECODE_APPROVAL_TOKEN",
                 "SAFECODE_TASK_ID", "CI", "GITHUB_ACTIONS"):
         env.pop(key, None)
     env.setdefault("PYTHONIOENCODING", "utf-8")

@@ -3,8 +3,8 @@
 覆盖：
 - --check-diff：拦下含 git push --force / git reset --hard / filter-branch / DROP DATABASE 的
   暂存改动（exit 1 + code 合理）；干净改动放行（exit 0）；--no-verify 记录 events.jsonl 并拒绝。
-- --pre-push：拦强推（构造非祖先关系）/ 删除远程分支（local_sha 全零）/ 受保护分支拒绝；
-  合法祖先关系放行（配 SAFECODE_ALLOW_MAIN=1 规避 main 保护）。
+- --pre-push：拦强推（构造非祖先关系）/ 删除远程分支（local_sha 全零）；
+  受保护分支给结构化授权请求（REQUIRE_APPROVAL），带匹配的一次性 token 才放行。
 - --preflight：对 git push --force 返回 REQUIRE_APPROVAL 且 metadata 含 operation_fingerprint；
   安全命令放行；--no-verify 拒绝。
 - Approval 全流程：无 token 拒绝 -> issue -> 带有效 token 放行 -> 重复同一 token 被拒（TOKEN_REPLAYED）
@@ -13,6 +13,7 @@
 - 所有 git-guard / hook-manager 输出均经 assert_result_schema 校验；--json 时 stdout 干净。
 """
 
+import json
 import os
 import shutil
 import sys
@@ -126,13 +127,15 @@ def test_pre_push_force_detected(tmp_git_repo):
     git(["checkout", "-q", "main"], cwd=repo)
     sha_a = _rev(repo, "HEAD")
 
-    line = f"refs/heads/main {sha_a} refs/heads/main {sha_b}\n"
+    # 推到非受保护分支，单独验证"强推"这条判定（受保护分支另有专门用例）
+    line = f"refs/heads/dev {sha_a} refs/heads/dev {sha_b}\n"
     proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo,
-                      stdin_text=line, env={"SAFECODE_ALLOW_MAIN": "1"})
+                      stdin_text=line)
     assert proc.returncode == 1, proc.stderr
     payload = parse_json_output(proc)
     assert_result_schema(payload)
     assert payload["decision"] == "REQUIRE_APPROVAL"
+    assert payload["code"] == "FORCE_PUSH"
 
 
 def test_pre_push_branch_deletion_detected(tmp_git_repo):
@@ -150,24 +153,63 @@ def test_pre_push_valid_ancestor_allowed(tmp_git_repo):
     _commit(repo, "c.txt", "C")
     local_sha = _rev(repo, "HEAD")
     remote_sha = _rev(repo, "HEAD~1")
-    line = f"refs/heads/main {local_sha} refs/heads/main {remote_sha}\n"
+    line = f"refs/heads/dev {local_sha} refs/heads/dev {remote_sha}\n"
     proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo,
-                      stdin_text=line, env={"SAFECODE_ALLOW_MAIN": "1"})
+                      stdin_text=line)
     assert proc.returncode == 0, proc.stderr
     payload = parse_json_output(proc)
     assert_result_schema(payload)
     assert payload["decision"] == "ALLOW"
 
 
-def test_pre_push_protected_branch_rejected(tmp_git_repo):
+def test_pre_push_protected_branch_requires_approval(tmp_git_repo):
+    """受保护分支不是硬拒绝：给出结构化授权请求，等一次性 token。"""
     repo = tmp_git_repo
     _commit(repo, "c.txt", "C")
     local_sha = _rev(repo, "HEAD")
     remote_sha = _rev(repo, "HEAD~1")
     line = f"refs/heads/main {local_sha} refs/heads/main {remote_sha}\n"
+
     proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line)
     assert proc.returncode == 1
-    assert parse_json_output(proc)["code"] == "PROTECTED_BRANCH_REJECTED"
+    payload = parse_json_output(proc)
+    assert_result_schema(payload)
+    assert payload["status"] == "PASS"
+    assert payload["decision"] == "REQUIRE_APPROVAL"
+    assert payload["code"] == "PROTECTED_BRANCH_APPROVAL_REQUIRED"
+    meta = payload["metadata"]
+    assert meta["operation"] == "git push refs/heads/main"
+    assert meta["operation_fingerprint"].startswith("sha256:")
+    assert "how_to_approve" in meta
+
+
+def test_pre_push_protected_branch_with_token_allowed(tmp_git_repo):
+    """带上匹配的一次性 token 就放行；同一个 token 不能再用第二次。"""
+    repo = tmp_git_repo
+    _commit(repo, "c.txt", "C")
+    local_sha = _rev(repo, "HEAD")
+    remote_sha = _rev(repo, "HEAD~1")
+    line = f"refs/heads/main {local_sha} refs/heads/main {remote_sha}\n"
+
+    denied = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line)
+    assert parse_json_output(denied)["decision"] == "REQUIRE_APPROVAL"
+
+    token = sa.issue_token("git push refs/heads/main", approved_by="human",
+                           ttl_minutes=10, cwd=str(repo))
+
+    allowed = run_script("git-guard.py", "--json", "--pre-push", cwd=repo,
+                         stdin_text=line,
+                         env={"SAFECODE_APPROVAL_TOKEN": json.dumps(token)})
+    assert allowed.returncode == 0, allowed.stderr
+    payload = parse_json_output(allowed)
+    assert payload["decision"] == "ALLOW"
+    assert payload["metadata"]["authorized"] is True
+
+    replayed = run_script("git-guard.py", "--json", "--pre-push", cwd=repo,
+                          stdin_text=line,
+                          env={"SAFECODE_APPROVAL_TOKEN": json.dumps(token)})
+    assert replayed.returncode == 1
+    assert "TOKEN_REPLAYED" in json.dumps(parse_json_output(replayed))
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +358,37 @@ def test_approve_subcommand_and_replay(tmp_git_repo):
 # --------------------------------------------------------------------------- #
 # Hook 生命周期
 # --------------------------------------------------------------------------- #
+
+def test_approval_cli_issue_and_verify(tmp_git_repo):
+    """回归：`safecode_approval.py issue` 曾因缺少 --cwd 直接 AttributeError。
+
+    受保护分支的授权流程必须能纯 CLI 走通：issue 打印 token 本身（不是 Result 信封），
+    因为它要原样回传给 SAFECODE_APPROVAL_TOKEN；verify 打印 Result 信封。
+    """
+    repo = tmp_git_repo
+    issue = run_script("safecode_approval.py", "issue",
+                       "--operation", "git push refs/heads/main",
+                       "--approved-by", "human", cwd=repo)
+    assert issue.returncode == 0, issue.stderr
+    token = json.loads(issue.stdout.strip())
+    assert token["token_type"] == "APPROVAL"
+    assert token["operation"] == "git push refs/heads/main"
+    assert token["operation_fingerprint"].startswith("sha256:")
+
+    verify = run_script("safecode_approval.py", "verify", "--token", "-",
+                        "--operation", "git push refs/heads/main",
+                        cwd=repo, stdin_text=issue.stdout)
+    assert verify.returncode == 0, verify.stderr
+    payload = parse_json_output(verify)
+    assert_result_schema(payload)
+    assert payload["code"] == "TOKEN_VALID"
+
+    # 操作换了就不认这个 token
+    mismatch = run_script("safecode_approval.py", "verify", "--token", "-",
+                          "--operation", "git push refs/heads/other",
+                          cwd=repo, stdin_text=issue.stdout)
+    assert mismatch.returncode != 0
+
 
 def test_hook_lifecycle(tmp_git_repo):
     repo = tmp_git_repo

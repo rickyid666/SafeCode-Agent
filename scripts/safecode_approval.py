@@ -325,6 +325,12 @@ def _load_token(token: Any) -> Dict[str, Any]:
         raw = token.strip()
         if not raw:
             raise ApprovalError(TOKEN_INVALID, "empty token")
+        if raw == "-":
+            # "-" 表示从 stdin 读（与 git-guard approve --token - 的约定一致）
+            stdin_text, timed_out = sc.read_stdin_safely()
+            if timed_out or not stdin_text.strip():
+                raise ApprovalError(TOKEN_INVALID, "no token provided on stdin")
+            raw = stdin_text.strip()
         if os.path.isfile(raw):
             try:
                 return sc.read_json_file(raw)
@@ -492,14 +498,16 @@ def main(argv: Optional[list] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_issue = sub.add_parser("issue", help="签发一次性 Approval Token")
-    sc.add_common_arguments(p_issue)
+    sc.add_common_arguments(p_issue, suppress_defaults=True)
+    p_issue.add_argument("--cwd", default=None, help="仓库根目录（默认当前工作目录）")
     p_issue.add_argument("--operation", required=True)
     p_issue.add_argument("--target", default="")
     p_issue.add_argument("--ttl", type=int, default=10)
     p_issue.add_argument("--approved-by", default="human")
 
     p_verify = sub.add_parser("verify", help="校验 Approval Token")
-    sc.add_common_arguments(p_verify)
+    sc.add_common_arguments(p_verify, suppress_defaults=True)
+    p_verify.add_argument("--cwd", default=None, help="仓库根目录（默认当前工作目录）")
     p_verify.add_argument("--token", required=True, help="token 文件路径 / JSON / -")
     p_verify.add_argument("--operation", required=True)
     p_verify.add_argument("--target", default="")

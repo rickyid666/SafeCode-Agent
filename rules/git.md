@@ -102,6 +102,27 @@ SafeCode 提供 hook 的 install / verify / update 三种生命周期操作。ve
 `core.hooksPath` 是否指向 `.githooks`、hook 是否存在、是否可执行、是否还在调用当前
 SafeCode 版本、有没有被别的脚本替换。
 
+## 受保护分支
+
+`main` / `master`（配置 `git.protected_branches`）默认不接受直推。但它不是
+"不可逆的危险操作"，所以处理方式是 **REQUIRE_APPROVAL**，而不是硬拒绝：
+
+```
+push 到受保护分支
+ -> git-guard 输出结构化授权请求（含 operation_fingerprint）
+ -> 阻断本次 push（exit 1，decision=REQUIRE_APPROVAL）
+ -> 人工复核后签发一次性 Approval Token
+ -> 带着 token 重跑同一个 push -> 指纹匹配、nonce 未用过 -> 放行
+```
+
+授权请求里的 `metadata.operation`（例如 `git push refs/heads/main`）就是要拿去签发的
+操作字符串；`metadata.operation_fingerprint` 绑定仓库身份、HEAD、目标分支与相关 diff。
+换个分支、换个提交，指纹就变了，必须重新授权。
+
+这里没有"裸环境变量开关"。一个 `SAFECODE_ALLOW_MAIN=1` 之类的开关等于永久解锁，
+和"授权必须绑定具体操作"直接冲突，所以不存在。要让某个分支彻底不受这条限制，
+就把它从 `git.protected_branches` 里去掉——这是配置文件里的显式决定，可审计。
+
 ## Checkpoint
 
 改高风险代码之前：
