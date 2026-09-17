@@ -3,8 +3,9 @@
 覆盖：
 - --check-diff：拦下含 git push --force / git reset --hard / filter-branch / DROP DATABASE 的
   暂存改动（exit 1 + code 合理）；干净改动放行（exit 0）；--no-verify 记录 events.jsonl 并拒绝。
-- --pre-push：拦强推（构造非祖先关系）/ 删除远程分支（local_sha 全零）；
-  受保护分支给结构化授权请求（REQUIRE_APPROVAL），带匹配的一次性 token 才放行。
+- --pre-push：拦强推（构造非祖先关系）；删除远程分支分层——受保护/默认分支硬拒，
+  普通分支给结构化授权请求（REQUIRE_APPROVAL，指纹绑定 expected old sha）；
+  受保护分支推送同样给授权请求，带匹配的一次性 token 才放行。
 - --preflight：对 git push --force 返回 REQUIRE_APPROVAL 且 metadata 含 operation_fingerprint；
   安全命令放行；--no-verify 拒绝。
 - Approval 全流程：无 token 拒绝 -> issue -> 带有效 token 放行 -> 重复同一 token 被拒（TOKEN_REPLAYED）
@@ -138,14 +139,82 @@ def test_pre_push_force_detected(tmp_git_repo):
     assert payload["code"] == "FORCE_PUSH"
 
 
-def test_pre_push_branch_deletion_detected(tmp_git_repo):
+def test_pre_push_normal_branch_deletion_requires_approval(tmp_git_repo):
+    """删普通分支是常规操作（合并后清理）-> REQUIRE_APPROVAL，并绑定 expected old sha。"""
     repo = tmp_git_repo
     sha = _rev(repo, "HEAD")
     zero = "0" * 40
-    line = f"refs/heads/feature {zero} refs/heads/feature {sha}\n"
+    line = f"(delete) {zero} refs/heads/feature {sha}\n"
+
     proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line)
-    assert proc.returncode == 1
-    assert parse_json_output(proc)["code"] == "BRANCH_DELETE_REJECTED"
+    assert proc.returncode == 1, proc.stderr
+    payload = parse_json_output(proc)
+    assert_result_schema(payload)
+    assert payload["decision"] == "REQUIRE_APPROVAL"
+    assert payload["code"] == "BRANCH_DELETE_APPROVAL_REQUIRED"
+    meta = payload["metadata"]
+    assert meta["operation"] == "git push --delete refs/heads/feature", meta["operation"]
+    # expected old sha 进指纹：批准时是 A、执行时已经是 B 的话必须重新授权
+    assert meta["target"] == sha, meta["target"]
+
+
+def test_pre_push_protected_branch_deletion_denied(tmp_git_repo):
+    """删受保护 / 默认分支是事故，没有"点头就做"的余地 -> 硬拒。"""
+    repo = tmp_git_repo
+    sha = _rev(repo, "HEAD")
+    zero = "0" * 40
+
+    for ref in ("refs/heads/main", "refs/heads/master"):
+        line = f"(delete) {zero} {ref} {sha}\n"
+        proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line)
+        assert proc.returncode == 1, proc.stderr
+        payload = parse_json_output(proc)
+        assert_result_schema(payload)
+        assert payload["decision"] == "DENY", payload
+        assert payload["code"] == "BRANCH_DELETE_REJECTED", payload
+
+
+def test_pre_push_branch_delete_token_binds_old_sha(tmp_git_repo):
+    """删除授权的全流程，重点在"批准后分支被推进"这条路径。
+
+    1) 无 token -> REQUIRE_APPROVAL
+    2) 拿旧 sha 签的 token 去删已经推进过的分支 -> 不能授权，回到 REQUIRE_APPROVAL
+    3) 用与当前状态匹配的 token -> 放行
+    """
+    repo = tmp_git_repo
+    _commit(repo, "f.txt", "F")
+    old_sha = _rev(repo, "HEAD")
+    zero = "0" * 40
+    operation = "git push --delete refs/heads/feature"
+    line_old = f"(delete) {zero} refs/heads/feature {old_sha}\n"
+
+    proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line_old)
+    assert parse_json_output(proc)["decision"] == "REQUIRE_APPROVAL"
+    assert parse_json_output(proc)["metadata"]["operation"] == operation
+
+    # 分支被推进：expected old sha 变了 -> 旧 token 不适用
+    _commit(repo, "g.txt", "G")
+    new_sha = _rev(repo, "HEAD")
+    line_new = f"(delete) {zero} refs/heads/feature {new_sha}\n"
+
+    stale = sa.issue_token(operation, approved_by="human", ttl_minutes=10,
+                           target=old_sha, cwd=str(repo))
+    proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line_new,
+                      env={"SAFECODE_APPROVAL_TOKEN": json.dumps(stale)})
+    payload = parse_json_output(proc)
+    assert_result_schema(payload)
+    assert payload["decision"] == "REQUIRE_APPROVAL", payload
+
+    # 与当前 sha 匹配的 token -> 放行
+    fresh = sa.issue_token(operation, approved_by="human", ttl_minutes=10,
+                           target=new_sha, cwd=str(repo))
+    proc = run_script("git-guard.py", "--json", "--pre-push", cwd=repo, stdin_text=line_new,
+                      env={"SAFECODE_APPROVAL_TOKEN": json.dumps(fresh)})
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    payload = parse_json_output(proc)
+    assert_result_schema(payload)
+    assert payload["decision"] == "ALLOW", payload
+    assert payload["metadata"]["authorized"] is True
 
 
 def test_pre_push_valid_ancestor_allowed(tmp_git_repo):

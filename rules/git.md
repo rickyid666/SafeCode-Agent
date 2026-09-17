@@ -143,6 +143,36 @@ push 到受保护分支
 和"授权必须绑定具体操作"直接冲突，所以不存在。要让某个分支彻底不受这条限制，
 就把它从 `git.protected_branches` 里去掉——这是配置文件里的显式决定，可审计。
 
+## 删除远程分支
+
+分两层，不是一刀切：
+
+```text
+受保护 / 默认分支（main、master、origin/HEAD 指向的分支）  ->  DENY
+普通分支（feature/*、ci/*、合并后的特性分支）              ->  REQUIRE_APPROVAL
+```
+
+合并后清理分支是常规操作，硬拒只会逼人去找绕过办法。但"可授权"必须配上"绑定具体
+版本"：删除操作的指纹额外包含 `expected old sha`（就是 hook 输入里的 `remote_sha`）。
+
+```bash
+# 1) 拿授权请求：--pre-push 读 hook 的 stdin
+#    REQUIRE_APPROVAL，metadata.operation = "git push --delete refs/heads/ci/x"
+#                       metadata.target    = <expected old sha>
+python scripts/git-guard.py --pre-push --json < hook_input.txt
+
+# 2) 照抄 operation 与 target 签发一次性 token
+python scripts/safecode_approval.py issue \
+    --operation "git push --delete refs/heads/ci/x" \
+    --target <expected old sha> --ttl 30 > token.json
+
+# 3) 带 token 重跑同一个删除
+SAFECODE_APPROVAL_TOKEN=token.json git push origin --delete ci/x
+```
+
+批准时分支头是 A、执行时已经被推到 B，指纹就不同，这份 token 不能授权本操作，必须
+重新授权。这条防的是"批准了一个目标、执行时删掉另一个"。
+
 ## Checkpoint
 
 改高风险代码之前：

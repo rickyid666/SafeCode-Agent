@@ -53,6 +53,9 @@ DEFAULT_LIMITS: Dict[str, Any] = {
     "max_total_time": "30m",
 }
 
+# L0 = 无错误（见契约的错误等级表），即"测试通过"。
+LEVEL_PASS = "L0"
+
 
 class BudgetError(Exception):
     """预算状态错误。code 直接作为 JSON result 的 code 字段。"""
@@ -286,14 +289,28 @@ def _append_history(state: Dict[str, Any], htype: str, level: str, code: str,
     })
 
 
-def record_test_run(task_id: str, *, root: Optional[str] = None, level: str = "L0",
+def record_test_run(task_id: str, *, root: Optional[str] = None, level: str = LEVEL_PASS,
                     code: str = "", summary: str = "", duration_seconds: float = 0,
-                    limits: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """记录一次测试运行失败：test_runs +1，consecutive_failures +1。"""
+                    limits: Optional[Dict[str, Any]] = None,
+                    passed: Optional[bool] = None) -> Dict[str, Any]:
+    """记录一次真实测试执行：test_runs +1，结果决定 consecutive_failures。
+
+    契约把 ``MAX_TOTAL_TEST_RUNS`` 定义为"实际测试执行次数"预算，所以**每次执行都计数**，
+    不分通过还是失败——否则连续通过 N 次之后这个计数仍是 0，预算名不副实（典型的名字与
+    语义漂移）。区分结果的是 ``consecutive_failures``：通过归零、失败累加，它才是
+    Recovery 循环的闸。``record_flaky_rerun`` 同样计数，因为 rerun 也是真实执行。
+
+    ``passed`` 不传时按 ``level == "L0"`` 推断。
+    """
+    if passed is None:
+        passed = (level == LEVEL_PASS)
 
     def mutate(state: Dict[str, Any]) -> Dict[str, Any]:
         state["test_runs"] = int(state["test_runs"]) + 1
-        state["consecutive_failures"] = int(state["consecutive_failures"]) + 1
+        if passed:
+            state["consecutive_failures"] = 0
+        else:
+            state["consecutive_failures"] = int(state["consecutive_failures"]) + 1
         if code:
             state["last_result_code"] = code
         _append_history(state, "test_run", level, code, summary, duration_seconds)

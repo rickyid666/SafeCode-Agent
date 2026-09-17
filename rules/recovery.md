@@ -45,7 +45,7 @@ L6 -> HARD STOP + HUMAN APPROVAL
 
 ```
 MAX_RECOVERY_ATTEMPTS = 3      单任务连续失败上限
-MAX_TOTAL_TEST_RUNS   = 20     累计测试运行次数
+MAX_TOTAL_TEST_RUNS   = 20     实际测试执行次数（通过与否都计数）
 MAX_TOTAL_RECOVERIES  = 10     累计自救次数
 MAX_TOTAL_TIME        = 30m    累计耗时
 ```
@@ -53,8 +53,13 @@ MAX_TOTAL_TIME        = 30m    累计耗时
 计数口径要说清楚：
 
 - **一次 Recovery**：针对一次已识别的失败原因采取修复动作，并进入下一次验证尝试。
+- **每一次真实测试执行都计入** `MAX_TOTAL_TEST_RUNS`，包括通过的那一次和每一次 Flaky
+  rerun。只有 `consecutive_failures` 区分结果（通过归零、失败累加），它才是自救循环的闸。
+  这让配置里的 `20` 就等于"最多跑 20 次测试"，而不是"最多失败 20 次"。
 - 单纯重跑同一个测试、没有修复动作，**不算 Recovery**，但仍然计入 `MAX_TOTAL_TEST_RUNS`。
 - Flaky 检测需要的 rerun 只消耗 Test Budget。
+- 已经通过的那一次不因预算耗尽被拒：结果里标 `budget_exhausted: true` 提示不要再跑，
+  但仍判 PASS —— 本次执行已经成功，"还能不能再跑"是另一回事。
 
 ```
 Test #1 FAIL -> 修复 -> Recovery #1 -> Test #2 FAIL -> 修复 -> Recovery #2 -> Test #3

@@ -70,6 +70,8 @@ L6     -> HARD STOP + 请求人工授权
 
 预算记在 `.safecode/state/<task-id>.json`：`max_recovery_attempts=3`、
 `max_total_test_runs=20`、`max_total_recoveries=10`、`max_total_time=30m`。
+`max_total_test_runs` 数的是**实际测试执行次数**——通过的那次与 Flaky rerun 都算，
+不只看失败；判断"该不该停"看的是 `consecutive_failures`。
 连续失败 3 次或预算耗尽就停手，输出诊断报告，交人工。
 
 ```bash
@@ -128,6 +130,15 @@ Effective Decision = ALLOW
 验证 operation fingerprint 匹配且未过期 -> 重放同一个操作。
 
 不要用 `git push --no-verify` 绕过；它不会让 CI 变成 PASS，只会被记录成绕过事件。
+
+本地门禁通过 ≠ 推送一定成功。目标分支开着 Required status checks 时，服务端还要求被推的
+commit 自己已经拿到这些 check 的成功状态，否则回 `GH006 ... required status checks are
+expected`。这种情况先把 commit 推到非保护分支让 CI 跑出来，再推目标分支：
+
+```bash
+git push origin HEAD:refs/heads/ci/<topic>   # 先让 CI 在这个 sha 上跑出 checks
+git push origin main                         # checks 满足后再推，本地门禁照走
+```
 
 ### 9. CI 再验证
 

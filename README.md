@@ -249,6 +249,21 @@ allow_deletions: false
 required_pull_request_reviews: null        restrictions: null
 ```
 
+这是**选定的策略**：要服务端的 checks 强制，不要 PR 强制。代价就是上面那条——
+main 的直推变成两段式。想换回一步直推，要么去掉 required checks、要么在 ruleset 里
+给 admin 配 bypass，两者都会削掉"绕过本地 hook 也拦得住"这一层。这是取舍，不是缺陷。
+
+删除远程分支的规则是另一套，分两层：
+
+```
+受保护 / 默认分支（main、master、origin/HEAD 指向的分支）  ->  DENY
+普通分支（feature/*、ci/*、合并后的特性分支）              ->  REQUIRE_APPROVAL
+```
+
+普通分支删除的授权指纹额外绑定 `expected old sha`（就是 hook 输入里的 `remote_sha`）：
+批准时分支头是 A、执行时已经被推到 B，指纹就不同，这份 token 不能用于本操作，必须
+重新授权。否则会出现"批准删除 ci/lock-fix，结果删掉了别的状态"。
+
 ## Rule → Detection → Gate → Test
 
 每条规则都能追溯到"谁检测、谁拦、谁测"。新增规则时必须同步补齐这四列。
@@ -265,6 +280,8 @@ required_pull_request_reviews: null        restrictions: null
 | Invalid `.safecode.yml` | config validator | Policy Engine（exit 2） | `test_config.py` |
 | Core invariant disabled in config | config validator | Policy Engine | `test_config.py` |
 | Force push | Git Guard | Hard Stop / Hook / CI | `test_git_guard.py` |
+| Protected/default branch deletion | Git Guard | Hard Stop（DENY） | `test_git_guard.py` |
+| Normal remote branch deletion | Git Guard | Hard Stop + Approval（绑定 expected old sha） | `test_git_guard.py` |
 | History rewrite | Git Guard | Hard Stop + Approval | `test_git_guard.py` |
 | Invalid / expired / replayed approval token | token verifier | Hard Stop | `test_git_guard.py` |
 | Operation fingerprint mismatch | fingerprint verifier | Hard Stop | `test_git_guard.py` |
@@ -272,9 +289,23 @@ required_pull_request_reviews: null        restrictions: null
 | Test failure | Test Runner | Recovery | `test_runner.py` |
 | Flaky test | reproducible rerun algorithm | Recovery policy | `test_runner.py` |
 | Budget exhausted | Persistent Budget | Recovery stop | `test_recovery.py` |
+| Passing run consumes test budget | Persistent Budget | Recovery policy | `test_runner.py` |
 | Schema invalid / missing result | result validator | Decision Resolver | `test_schema.py` |
 | JSON vs exit code conflict | Decision Resolver | all gates | `test_schema.py` |
 | CI failure | Required check | Branch Protection | CI workflows |
+
+## Test Budget 语义
+
+`recovery.max_total_test_runs` 是**实际测试执行次数**上限，不是"失败次数"上限：
+
+- 通过的那次运行也计数，Flaky rerun 也计数（rerun 同样是真实执行）。
+- 通过时 `consecutive_failures` 归零、失败时累加——**区分结果的是这个计数器**，
+  它才是 Recovery 循环的闸（配 `max_recovery_attempts`）。
+- 已经通过的那次不因额度耗尽被拒绝：跑完报 `budget_exhausted: true` 提示"不要再跑"，
+  但结果仍是 `PASS` / `ALLOW`。否则会得出"测试通过却被判 DENY"这种荒谬结论。
+
+为什么专门写一段：只让失败计数看起来也能防死循环，但会让 `.safecode.yml` 里的 `20`
+名不副实——连续通过 1000 次，计数仍然是 0。这是典型的名字与语义漂移。
 
 ## 反复用到的两个机制
 

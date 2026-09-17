@@ -48,6 +48,8 @@ testing:
 
 recovery:
   max_recovery_attempts: 3
+  # max_total_test_runs = 真实测试执行次数上限。通过与否都计数（Flaky rerun 也算），
+  # 所以连续通过 20 次同样会耗尽额度 —— 这样配置里的数字才等于"最多跑几次测试"。
   max_total_test_runs: 20
   max_total_recoveries: 10
   max_total_time: 30m

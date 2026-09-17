@@ -6,7 +6,8 @@
   --pre-push
       读取 git pre-push hook 的 stdin（每行 "local_ref local_sha remote_ref remote_sha"，
       允许空行与 EOF 结束），逐项检查：
-        * 删除远程分支（local_sha 全零）-> 拒绝
+        * 删除远程分支（local_sha 全零）：受保护/默认分支 -> 拒绝；
+          普通分支 -> REQUIRE_APPROVAL（指纹额外绑定 expected old sha）
         * 强推：remote_sha 非全零 且 git merge-base --is-ancestor 失败 -> 拒绝（L6 授权）
         * merge-base 执行失败 -> 按 L6 处理（不确定 = 不安全）
         * 推送到受保护分支（配置 protected_branches，默认 main/master）
@@ -367,14 +368,31 @@ def cmd_preflight(reporter, command, cwd) -> int:
     return _emit(reporter, result)
 
 
+def _default_branches(cwd) -> set:
+    """尽力解析远程默认分支，再拿 main/master 兜底。
+
+    删掉默认分支基本等于事故，所以这类目标走硬拒，而不是"点头就做"。
+    """
+    names = {"main", "master"}
+    proc = sc.run_git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=cwd, timeout=10)
+    if proc.returncode == 0:
+        ref = (proc.stdout or "").strip()
+        prefix = "refs/remotes/origin/"
+        if ref.startswith(prefix):
+            names.add(ref[len(prefix):])
+    return names
+
+
 def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
     protected = _protected_branches(cwd)
+    defaults = _default_branches(cwd)
 
     hard_reasons = []   # FAIL + DENY
     soft_reasons = []   # REQUIRE_APPROVAL（可授权）
     hard_meta = []
     soft_meta = []
     approval_refs = set()   # 需要授权的 remote ref，用于拼出可复现的 operation 字符串
+    delete_refs = []        # 需要授权的删除操作：(remote_ref, expected_old_sha)
 
     for raw_line in stdin_text.splitlines():
         line = raw_line.strip()
@@ -385,22 +403,36 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
             continue
         local_ref, local_sha, remote_ref, remote_sha = parts[0], parts[1], parts[2], parts[3]
 
-        # 删除远程分支
-        if local_sha == ZERO_SHA:
-            hard_reasons.append("BRANCH_DELETE_REJECTED")
-            hard_meta.append(f"refusing to delete remote branch: {remote_ref} (local_sha is zero)")
-            continue
-
-        # 解析远程分支名，再判定是否属于受保护分支。
-        #
-        # 受保护分支不是"不可逆的危险操作"，而是"需要人工点头的一次性决定"
-        # -> REQUIRE_APPROVAL（可用一次性 Approval Token 核销后放行）。
-        # 这里不再提供裸环境变量开关：契约要求授权必须绑定 operation fingerprint，
-        # 而一个裸开关等于"永久解锁 SafeCode"。
+        # 先解析远程分支名：删除判定和受保护分支判定都要用它
         if "refs/heads/" in remote_ref:
             branch = remote_ref.split("refs/heads/", 1)[1]
         else:
             branch = remote_ref
+
+        # 删除远程分支分两层：
+        #   受保护 / 默认分支 -> 硬拒（删了就是事故，没有"点头就做"的余地）
+        #   其他分支         -> REQUIRE_APPROVAL（合并后清理特性分支是常规操作）
+        # 授权绑定 expected old sha，避免"批准时是 A、执行时删掉 B"。
+        if local_sha == ZERO_SHA:
+            if branch in protected or branch in defaults:
+                hard_reasons.append("BRANCH_DELETE_REJECTED")
+                hard_meta.append(
+                    f"refusing to delete protected/default branch {remote_ref} "
+                    f"(local_sha is zero)"
+                )
+            else:
+                soft_reasons.append("BRANCH_DELETE_APPROVAL_REQUIRED")
+                soft_meta.append(
+                    f"deleting remote branch {remote_ref} requires human approval "
+                    f"(expected old sha {remote_sha[:12]})"
+                )
+                delete_refs.append((str(remote_ref), remote_sha))
+            continue
+
+        # 受保护分支不是"不可逆的危险操作"，而是"需要人工点头的一次性决定"
+        # -> REQUIRE_APPROVAL（可用一次性 Approval Token 核销后放行）。
+        # 这里不再提供裸环境变量开关：契约要求授权必须绑定 operation fingerprint，
+        # 而一个裸开关等于"永久解锁 SafeCode"。
         if branch in protected:
             soft_reasons.append("PROTECTED_BRANCH_APPROVAL_REQUIRED")
             soft_meta.append(
@@ -461,13 +493,26 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
 
     if soft_reasons:
         # 尝试用 token 授权（operation 绑定到本次 push）
+        #
+        # operation 要可复现、且与 hook 输入里的 sha 无关，人类照着 JSON 里这个字符串
+        # 签发 token 就能对上指纹。多种风险用 "; " 连接。
+        op_parts = []
         if approval_refs:
-            # 用 remote ref 拼 operation：可复现、和 hook 输入里的 sha 无关，
-            # 人类照着 JSON 里的这个字符串签发 token 就能对上指纹
-            operation = "git push " + " ".join(sorted(approval_refs))
+            op_parts.append("git push " + " ".join(sorted(approval_refs)))
+        if delete_refs:
+            op_parts.append(
+                "git push --delete " + " ".join(sorted(ref for ref, _ in delete_refs))
+            )
+        if op_parts:
+            operation = "; ".join(op_parts)
         else:
             operation = sa.normalize_operation(stdin_text) or "git push"
-        status, payload = _try_authorize(operation, target="", relevant_diff="", cwd=cwd)
+
+        # 删除操作的授权必须钉住"要删掉的那个版本"：批准时分支头是 A，执行时已经变成 B，
+        # 指纹就不同，这份 token 不能授权本操作，必须重新授权。
+        target = ",".join(sha for _, sha in sorted(delete_refs))
+
+        status, payload = _try_authorize(operation, target=target, relevant_diff="", cwd=cwd)
         if status == "authorized":
             result = sc.pass_result(
                 soft_reasons[0],
@@ -493,6 +538,7 @@ def cmd_pre_push(reporter, stdin_text, cwd, max_changed, max_deleted) -> int:
         req = sa.build_authorization_request(
             soft_reasons[0], operation,
             severity=sc.SEVERITY_HIGH, risk_level=sc.L6, cwd=cwd, ttl_minutes=10,
+            target=target,
         )
         req["metadata"]["reasons"] = soft_meta
         req["message"] = "; ".join(soft_meta)

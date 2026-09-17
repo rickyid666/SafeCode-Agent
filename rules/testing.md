@@ -68,6 +68,9 @@ Environment Error / Real Bug / Flaky Test / Unknown
 每次 rerun 都要记录 run 序号、退出码、失败测试 id、代码状态（HEAD）、环境摘要，
 让结果可复现、可审计。rerun 消耗 Test Budget，不消耗 Recovery 次数。
 
+Test Budget（`max_total_test_runs`）数的是实际执行次数，所以**通过的那次也消耗**：
+它回答"一共跑了几次测试"，"是不是白跑"由 `consecutive_failures` 单独判断。
+
 ## 测试结果要能被机器读
 
 `test-runner.py` 会把结果整理成 Structured JSON：等级（L0..L6）、类别、失败测试列表、

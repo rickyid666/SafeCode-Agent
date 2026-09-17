@@ -9,8 +9,10 @@
   结果不稳定（既有 PASS 又有 FAIL）-> category = FLAKY_TEST，
   仍然 DENY（测试套件确实没通过，不能放行 Push），但明确提示"不要修改业务代码"。
   每次运行结果都记录下来（run 序号、退出码、失败测试、HEAD sha、环境摘要）以便复现与审计。
-- 预算：初始运行计 test_runs，Flaky rerun 只计 test_runs（record_flaky_rerun），
-  两者都不计 recoveries。预算耗尽 -> BUDGET_EXHAUSTED + DENY。
+- 预算：**每一次真实测试执行都计入 test_runs**（含通过的那次与每一次 Flaky rerun），
+  因为契约把 MAX_TOTAL_TEST_RUNS 定义为"实际执行次数"。通过时 consecutive_failures
+  归零、失败时累加；两者都不计 recoveries。失败路径上预算耗尽 -> BUDGET_EXHAUSTED + DENY；
+  已经通过的那次不因预算耗尽被拒，只在结果里标注 budget_exhausted 并提示不要再跑。
 - 检查无法完成（pytest 不可用、超时）-> 不 PASS。
 
 纯 Python 标准库。Python >= 3.10。
@@ -59,7 +61,6 @@ from safecode_budget import (  # noqa: E402
     get_current_task,
     load_state,
     record_flaky_rerun,
-    record_success,
     record_test_run,
     set_current_task,
 )
@@ -305,12 +306,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     runs: List[RunResult] = [first]
 
     if first.passed:
+        passed_state: Optional[Dict[str, Any]] = None
+        budget_note: Optional[str] = None
         try:
-            record_success(task_id, root=root, code=CODE_TEST_PASSED,
-                           summary="all tests passed", duration_seconds=first.duration)
+            # 通过也是一次"真实测试执行"，必须计入 test_runs —— 契约把
+            # MAX_TOTAL_TEST_RUNS 定义为实际执行次数，不是失败次数。见 README
+            # 「Test Budget 语义」一节。
+            passed_state = record_test_run(task_id, root=root, level=L0, code=CODE_TEST_PASSED,
+                                           summary="all tests passed",
+                                           duration_seconds=first.duration, passed=True)
+            budget_note = check_exhausted(passed_state, limits)
         except BudgetError as exc:
             reporter.warn(f"budget update failed: {exc}")
-        result = pass_result(CODE_TEST_PASSED, "all tests passed",
+        if budget_note:
+            # 已经通过，不因预算耗尽拒绝本次结果；但不能假装还有额度。
+            reporter.warn(f"test budget exhausted: {budget_note}")
+        message = "all tests passed"
+        if budget_note:
+            message = (f"all tests passed, but the test budget is exhausted ({budget_note}); "
+                       "do not run further tests without a human decision")
+        result = pass_result(CODE_TEST_PASSED, message,
                              category=CATEGORY_TEST,
                              metadata={
                                  "level": L0,
@@ -320,6 +335,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                  "exit_code": first.returncode,
                                  "duration_seconds": round(first.duration, 2),
                                  "runs": [r.to_dict(i + 1) for i, r in enumerate(runs)],
+                                 "budget": budget_report(passed_state, limits) if passed_state else None,
+                                 "budget_exhausted": bool(budget_note),
                              })
         reporter.info("tests passed")
         return reporter.emit_result(result, exit_code=EXIT_OK)
@@ -343,7 +360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         budget_state = record_test_run(task_id, root=root, level=level, code=code,
                                        summary=first.summary_line(),
-                                       duration_seconds=first.duration)
+                                       duration_seconds=first.duration, passed=False)
         budget_exhausted_reason = check_exhausted(budget_state, limits)
     except BudgetError as exc:
         reporter.error(f"budget update failed: {exc}")
